@@ -44,9 +44,13 @@
 | `systemPrompt` | 系统提示词（人设） |
 | `maxTokens` | 上下文上限，超限自动压缩 |
 | `temperature` | 采样温度 |
+| `enableThinking` | 是否开启思考模式（true/false） |
+| `thinkingEffort` | 思考强度：low / medium / high（OpenAI 兼容格式） |
 | `screenshotInterval` | 自动截图间隔（消息数） |
 | `debug` | 调试输出开关 |
 
+> 💡 **关于思考模式**：`enableThinking` 为 `true` 时，请求会携带 OpenAI 兼容的 `reasoning_effort` 字段（取值 `thinkingEffort`）控制思考强度；为 `false` 时会发送 `enable_thinking: false` 关闭思考。注意：模型本身是否支持思考由服务端决定。
+>
 > 💡 **提示**：若使用的模型不支持多模态（不能接收图片），请将 `screenshotInterval` 设为较大的数（如 `9999999999999999`），即可防止向模型发送截图。
 
 ## 🚀 使用

@@ -56,6 +56,19 @@ bool loadConfig(const std::string& filename, AgentConfig& config) {
         if (root.has("maxToolIterations")) config.maxToolIterations = (int)root["maxToolIterations"].asNumber();
         if (root.has("debug")) config.debug = root["debug"].asBool();
         
+        // 思考模式配置（OpenAI 兼容格式）
+        if (root.has("enableThinking")) config.enableThinking = root["enableThinking"].asBool();
+        if (root.has("thinkingEffort")) {
+            config.thinkingEffort = root["thinkingEffort"].asString();
+            if (config.thinkingEffort != "low" &&
+                config.thinkingEffort != "medium" &&
+                config.thinkingEffort != "high") {
+                std::cerr << "[WARNING] Invalid thinkingEffort '" << config.thinkingEffort
+                          << "', using 'medium'" << std::endl;
+                config.thinkingEffort = "medium";
+            }
+        }
+        
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Error parsing config: " << e.what() << std::endl;
@@ -85,6 +98,10 @@ int main(int argc, char* argv[]) {
     
     // Print debug status
     std::cout << "Debug mode: " << (config.debug ? "ON" : "OFF") << std::endl;
+    std::cout << "Thinking mode: " << (config.enableThinking ? "ON" : "OFF") << std::endl;
+    if (config.enableThinking) {
+        std::cout << "Thinking effort: " << config.thinkingEffort << std::endl;
+    }
     
     // Create and run agent
     Agent agent;

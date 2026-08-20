@@ -21,10 +21,12 @@ struct AgentConfig {
     double topP;
     int maxToolIterations;
     bool debug;
+    bool enableThinking;        // 是否开启思考模式（true 时发送 reasoning_effort）
+    std::string thinkingEffort; // 思考强度：low / medium / high（OpenAI 兼容格式）
     
     AgentConfig() : screenshotInterval(5), maxTokens(8000), 
                     temperature(0.7), topP(0.9), maxToolIterations(10),
-                    debug(false) {}
+                    debug(false), enableThinking(true), thinkingEffort("medium") {}
 };
 
 class Agent {

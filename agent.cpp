@@ -742,6 +742,16 @@ std::string Agent::buildRequestJSON() {
     root["top_p"] = config_.topP;
     // 把工具列表发给AI（OpenAI function calling 格式）
     root["tools"] = buildToolList();
+    
+    // 思考模式配置（OpenAI 兼容格式）
+    if (config_.enableThinking) {
+        // 开启思考：发送 reasoning_effort 控制思考强度
+        root["reasoning_effort"] = config_.thinkingEffort; // low / medium / high
+    } else {
+        // 关闭思考：发送 enable_thinking=false（OpenAI 兼容 API 常见字段）
+        root["enable_thinking"] = false;
+    }
+    
     return json::serialize(root);
 }
 
