@@ -15,6 +15,7 @@
 - 🧠 **长对话压缩**：上下文超限自动压缩历史消息，防止内存爆炸
 - 💬 **记忆消息**：支持持久记忆，跨会话保持上下文
 - 🖼️ **多模态**：支持图片输入（如截图），配合视觉模型使用
+- 💭 **思考链输出**：可在控制台查看模型的思考过程（reasoning_content）
 - 🪶 **轻量**：纯 C++ 实现，仅依赖 curl，编译产物小巧
 
 ## 🛠️ 工具列表
@@ -46,10 +47,13 @@
 | `temperature` | 采样温度 |
 | `enableThinking` | 是否开启思考模式（true/false） |
 | `thinkingEffort` | 思考强度：low / medium / high（OpenAI 兼容格式） |
+| `outputThinking` | 是否在控制台输出思考链（true/false） |
 | `screenshotInterval` | 自动截图间隔（消息数） |
 | `debug` | 调试输出开关 |
 
 > 💡 **关于思考模式**：`enableThinking` 为 `true` 时，请求会携带 OpenAI 兼容的 `reasoning_effort` 字段（取值 `thinkingEffort`）控制思考强度；为 `false` 时会发送 `enable_thinking: false` 关闭思考。注意：模型本身是否支持思考由服务端决定。
+>
+> 💡 **关于思考链输出**：`outputThinking` 为 `true` 时，会把模型返回的思考过程打印到控制台（支持 OpenAI 兼容格式的 `reasoning_content`、DashScope 原生格式的 `thought` 等字段），并以 `[Thinking]:` 标记；为 `false` 时隐藏。需搭配支持返回思考内容的模型（如推理类模型）使用。
 >
 > 💡 **提示**：若使用的模型不支持多模态（不能接收图片），请将 `screenshotInterval` 设为较大的数（如 `9999999999999999`），即可防止向模型发送截图。
 

@@ -11,5 +11,6 @@
     "maxToolIterations": 10,
     "debug": true,
     "enableThinking": true,
-    "thinkingEffort": "medium"
+    "thinkingEffort": "medium",
+    "outputThinking": true
 }

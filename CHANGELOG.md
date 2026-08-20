@@ -1,5 +1,19 @@
 # 更新日志
 
+## [1.2.0] - 2026-08-21
+
+### 新增
+
+- 新增输出思考链功能，可在控制台查看模型的思考过程
+- 新增配置项 `outputThinking`：是否输出思考链，默认 `true`
+- 支持多种思考内容格式：
+  - OpenAI 兼容：`choices[0].message.reasoning_content`（DeepSeek / Qwen 等）
+  - `choices[0].message.reasoning`
+  - DashScope 原生：`output.thought` / `output.reasoning`
+  - 顶层 `reasoning_content` / `reasoning`
+- 打印时以 `[Thinking]:` 标记，并做 GBK/UTF-8 编码转换，避免 Windows 控制台乱码
+- 启动时打印 `Thinking output: ON/OFF` 状态
+
 ## [1.1.0] - 2026-08-21
 
 ### 新增

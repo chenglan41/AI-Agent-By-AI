@@ -184,17 +184,21 @@ void Agent::processInput(const std::string& userInput) {
         std::string thinking, finalResponse;
         extractResponse(response, thinking, finalResponse);
         
-        // Display thinking
-        if (!thinking.empty() && config_.debug) {
+        // Display thinking chain (controlled by config outputThinking)
+        if (config_.outputThinking) {
+            // 优先输出 API 返回的思考链（reasoning_content），
+            // 没有的话退回 <thinking> 标签提取的内容
+            std::string displayThinking = !lastThinking_.empty() ? lastThinking_ : thinking;
+            if (!displayThinking.empty()) {
 #ifdef _WIN32
-            std::string displayThinking = thinking;
-            if (isUTF8(displayThinking)) {
-                displayThinking = UTF8ToGBK(displayThinking);
-            }
-            std::cout << "\n[Thinking]: " << displayThinking << std::endl;
+                if (isUTF8(displayThinking)) {
+                    displayThinking = UTF8ToGBK(displayThinking);
+                }
+                std::cout << "\n[Thinking]: " << displayThinking << std::endl;
 #else
-            std::cout << "\n[Thinking]: " << thinking << std::endl;
+                std::cout << "\n[Thinking]: " << displayThinking << std::endl;
 #endif
+            }
         }
         
         // Check for tool call
@@ -422,7 +426,69 @@ static std::string parseMultiFormatResponse(const std::string& response, bool de
     }
 }
 
+// Extract reasoning/thinking chain from raw API response
+// Supports: choices[0].message.reasoning_content (DeepSeek/Qwen OpenAI-compatible),
+//           choices[0].message.reasoning, top-level reasoning_content/reasoning,
+//           DashScope native output.thought / output.reasoning
+static std::string parseReasoningContent(const std::string& response, bool debug) {
+    try {
+        json::Value root = json::parse(response);
+        
+        // OpenAI compatible format
+        if (root.has("choices") && root["choices"].isArray() && root["choices"].size() > 0) {
+            const json::Value& choice = root["choices"][0];
+            if (choice.has("message")) {
+                const json::Value& message = choice["message"];
+                
+                if (message.has("reasoning_content") && message["reasoning_content"].isString()) {
+                    std::string r = message["reasoning_content"].asString();
+                    if (!r.empty()) {
+                        if (debug) {
+                            std::cout << "[DEBUG] Detected reasoning_content (OpenAI-compatible)" << std::endl;
+                        }
+                        return r;
+                    }
+                }
+                if (message.has("reasoning") && message["reasoning"].isString()) {
+                    std::string r = message["reasoning"].asString();
+                    if (!r.empty()) return r;
+                }
+            }
+        }
+        
+        // DashScope native format
+        if (root.has("output") && root["output"].isObject()) {
+            const json::Value& output = root["output"];
+            if (output.has("thought") && output["thought"].isString()) {
+                std::string r = output["thought"].asString();
+                if (!r.empty()) return r;
+            }
+            if (output.has("reasoning") && output["reasoning"].isString()) {
+                std::string r = output["reasoning"].asString();
+                if (!r.empty()) return r;
+            }
+        }
+        
+        // Top-level fields
+        if (root.has("reasoning_content") && root["reasoning_content"].isString()) {
+            return root["reasoning_content"].asString();
+        }
+        if (root.has("reasoning") && root["reasoning"].isString()) {
+            return root["reasoning"].asString();
+        }
+        
+    } catch (const std::exception& e) {
+        if (debug) {
+            std::cerr << "[DEBUG] Reasoning parse error: " << e.what() << std::endl;
+        }
+    }
+    
+    return "";
+}
+
 std::string Agent::sendToAI() {
+    lastThinking_.clear();
+    
     std::string requestBody = buildRequestJSON();
     std::string response = http_.post(config_.baseURL, requestBody);
     
@@ -482,6 +548,9 @@ std::string Agent::sendToAI() {
             std::cerr << "[DEBUG] Error check parse failed: " << e.what() << std::endl;
         }
     }
+    
+    // Extract reasoning/thinking chain from raw response (if any)
+    lastThinking_ = parseReasoningContent(response, config_.debug);
     
     // Use multi-format parser
     return parseMultiFormatResponse(response, config_.debug);

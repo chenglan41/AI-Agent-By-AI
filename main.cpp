@@ -69,6 +69,9 @@ bool loadConfig(const std::string& filename, AgentConfig& config) {
             }
         }
         
+        // 思考链输出配置
+        if (root.has("outputThinking")) config.outputThinking = root["outputThinking"].asBool();
+        
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Error parsing config: " << e.what() << std::endl;
@@ -102,6 +105,7 @@ int main(int argc, char* argv[]) {
     if (config.enableThinking) {
         std::cout << "Thinking effort: " << config.thinkingEffort << std::endl;
     }
+    std::cout << "Thinking output: " << (config.outputThinking ? "ON" : "OFF") << std::endl;
     
     // Create and run agent
     Agent agent;

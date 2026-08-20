@@ -23,10 +23,12 @@ struct AgentConfig {
     bool debug;
     bool enableThinking;        // 是否开启思考模式（true 时发送 reasoning_effort）
     std::string thinkingEffort; // 思考强度：low / medium / high（OpenAI 兼容格式）
+    bool outputThinking;        // 是否输出思考链（模型返回的 reasoning_content）
     
     AgentConfig() : screenshotInterval(5), maxTokens(8000), 
                     temperature(0.7), topP(0.9), maxToolIterations(10),
-                    debug(false), enableThinking(true), thinkingEffort("medium") {}
+                    debug(false), enableThinking(true), thinkingEffort("medium"),
+                    outputThinking(true) {}
 };
 
 class Agent {
@@ -69,6 +71,9 @@ private:
     
     // Memory compression prompt template
     std::string memoryPromptTemplate_;
+    
+    // Last reasoning/thinking chain extracted from raw API response
+    std::string lastThinking_;
     
     // Send messages to AI and get response
     std::string sendToAI();
