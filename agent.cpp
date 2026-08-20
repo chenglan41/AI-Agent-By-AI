@@ -1,0 +1,901 @@
+// agent.cpp - AI Agent core logic implementation
+#include "agent.h"
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <thread>
+#include <chrono>
+#include <regex>
+#include <string>
+
+#ifdef _WIN32
+#include <windows.h>
+
+std::string GBKToUTF8(const std::string& gbkStr) {
+    if (gbkStr.empty()) return gbkStr;
+    
+    int wlen = MultiByteToWideChar(CP_ACP, 0, gbkStr.c_str(), -1, NULL, 0);
+    if (wlen <= 0) return gbkStr;
+    
+    wchar_t* wstr = new wchar_t[wlen];
+    MultiByteToWideChar(CP_ACP, 0, gbkStr.c_str(), -1, wstr, wlen);
+    
+    int ulen = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+    if (ulen <= 0) { delete[] wstr; return gbkStr; }
+    
+    char* utf8Str = new char[ulen];
+    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, utf8Str, ulen, NULL, NULL);
+    
+    std::string result(utf8Str);
+    delete[] wstr;
+    delete[] utf8Str;
+    return result;
+}
+
+std::string UTF8ToGBK(const std::string& utf8Str) {
+    if (utf8Str.empty()) return utf8Str;
+    
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8Str.c_str(), -1, NULL, 0);
+    if (wlen <= 0) return utf8Str;
+    
+    wchar_t* wstr = new wchar_t[wlen];
+    MultiByteToWideChar(CP_UTF8, 0, utf8Str.c_str(), -1, wstr, wlen);
+    
+    int glen = WideCharToMultiByte(CP_ACP, 0, wstr, -1, NULL, 0, NULL, NULL);
+    if (glen <= 0) { delete[] wstr; return utf8Str; }
+    
+    char* gbkStr = new char[glen];
+    WideCharToMultiByte(CP_ACP, 0, wstr, -1, gbkStr, glen, NULL, NULL);
+    
+    std::string result(gbkStr);
+    delete[] wstr;
+    delete[] gbkStr;
+    return result;
+}
+
+bool isUTF8(const std::string& str) {
+    size_t i = 0;
+    while (i < str.size()) {
+        unsigned char c = str[i];
+        int bytes = 0;
+        
+        if (c < 0x80) {
+            bytes = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            bytes = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            bytes = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            bytes = 4;
+        } else {
+            return false;
+        }
+        
+        if (i + bytes > str.size()) return false;
+        
+        for (int j = 1; j < bytes; j++) {
+            if ((str[i + j] & 0xC0) != 0x80) return false;
+        }
+        
+        i += bytes;
+    }
+    return true;
+}
+#endif
+
+Agent::Agent() : lastScreenshotTime_(std::chrono::steady_clock::now()) {
+}
+
+Agent::~Agent() {
+}
+
+bool Agent::init(const AgentConfig& config) {
+    config_ = config;
+    http_.setHeader("Authorization", "Bearer " + config_.apiKey);
+    http_.setHeader("Content-Type", "application/json");
+    http_.setDebug(config_.debug);
+    return true;
+}
+
+bool Agent::loadSystemPrompt(const std::string& filename) {
+    std::ifstream file(filename.c_str());
+    if (!file.is_open()) {
+        if (config_.debug) {
+            std::cerr << "Failed to open system prompt file: " << filename << std::endl;
+        }
+        return false;
+    }
+    
+    std::stringstream ss;
+    ss << file.rdbuf();
+    file.close();
+    
+    // 替换第一条 system 消息，避免缓存里的旧提示词残留
+    cache_.replaceSystemPrompt(ss.str());
+    return true;
+}
+
+void Agent::setSystemPrompt(const std::string& prompt) {
+    // 替换第一条 system 消息，避免缓存里的旧提示词残留
+    cache_.replaceSystemPrompt(prompt);
+}
+
+bool Agent::loadCache(const std::string& filename) {
+    return cache_.load(filename);
+}
+
+bool Agent::saveCache(const std::string& filename) {
+    return cache_.save(filename);
+}
+
+void Agent::run() {
+    std::cout << "=== AI Agent Started ===" << std::endl;
+    std::cout << "Type 'exit' or 'quit' to stop" << std::endl;
+    std::cout << "========================" << std::endl;
+    
+    while (true) {
+        std::cout << "\n[You]: ";
+        std::string input;
+        std::getline(std::cin, input);
+        
+#ifdef _WIN32
+        if (!input.empty() && !isUTF8(input)) {
+            input = GBKToUTF8(input);
+        }
+#endif
+        
+        if (input == "exit" || input == "quit") {
+            std::cout << "Exiting..." << std::endl;
+            break;
+        }
+        
+        if (input.empty()) continue;
+        
+        processInput(input);
+    }
+}
+
+void Agent::processInput(const std::string& userInput) {
+    // Capture screenshot if interval has passed
+    captureAndAddScreenshot();
+    
+    // Add user message to cache
+    cache_.addMessage("user", userInput);
+    
+    // Compress old messages into long-term memory if over token limit
+    compressToMemory();
+    
+    // Send to AI and handle tool calls
+    int iterations = 0;
+    while (iterations < config_.maxToolIterations) {
+        if (config_.debug) {
+            std::cout << "[Thinking...]" << std::endl;
+        }
+        
+        std::string response = sendToAI();
+        if (response.empty()) {
+            if (config_.debug) {
+                std::cout << "[Error: Empty response from AI]" << std::endl;
+            }
+            break;
+        }
+        
+        // Parse response
+        std::string thinking, finalResponse;
+        extractResponse(response, thinking, finalResponse);
+        
+        // Display thinking
+        if (!thinking.empty() && config_.debug) {
+#ifdef _WIN32
+            std::string displayThinking = thinking;
+            if (isUTF8(displayThinking)) {
+                displayThinking = UTF8ToGBK(displayThinking);
+            }
+            std::cout << "\n[Thinking]: " << displayThinking << std::endl;
+#else
+            std::cout << "\n[Thinking]: " << thinking << std::endl;
+#endif
+        }
+        
+        // Check for tool call
+        std::string toolName;
+        json::Value params;
+        
+        if (parseToolCall(response, toolName, params)) {
+            if (config_.debug) {
+                std::cout << "[Tool Call]: " << toolName << std::endl;
+            }
+            
+            // Execute tool
+            std::string result = tools_.execute(toolName, params);
+            if (config_.debug) {
+#ifdef _WIN32
+                std::string displayResult = result;
+                if (isUTF8(displayResult)) {
+                    displayResult = UTF8ToGBK(displayResult);
+                }
+                std::cout << "[Tool Result]: " << displayResult << std::endl;
+#else
+                std::cout << "[Tool Result]: " << result << std::endl;
+#endif
+            }
+            
+            // Add assistant message and tool result (role="tool") to cache
+            cache_.addMessage("assistant", response);
+            cache_.addToolResult(toolName, result);
+            
+            iterations++;
+            continue;
+        }
+        
+        // No tool call, display final response
+        if (!finalResponse.empty()) {
+            cache_.addMessage("assistant", finalResponse);
+            
+#ifdef _WIN32
+            std::string displayResponse = finalResponse;
+            if (isUTF8(displayResponse)) {
+                displayResponse = UTF8ToGBK(displayResponse);
+            }
+            std::cout << "\n[Agent]: " << displayResponse << std::endl;
+#else
+            std::cout << "\n[Agent]: " << finalResponse << std::endl;
+#endif
+        }
+        
+        break;
+    }
+    
+    // Save cache after each interaction
+    saveCache("content.txt");
+}
+
+void Agent::captureAndAddScreenshot() {
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        now - lastScreenshotTime_).count();
+    
+    // Check if screenshot interval has passed
+    if (elapsed >= config_.screenshotInterval) {
+        if (config_.debug) {
+            std::cout << "[Capturing screenshot...]" << std::endl;
+        }
+        
+        std::string base64Image = Screenshot::captureAsBase64(85);
+        
+        if (!base64Image.empty()) {
+            // Add screenshot to cache
+            cache_.addScreenshot(base64Image);
+            
+            if (config_.debug) {
+                std::cout << "[Screenshot captured and added to cache]" << std::endl;
+            }
+        } else {
+            if (config_.debug) {
+                std::cerr << "[Failed to capture screenshot]" << std::endl;
+            }
+        }
+        
+        lastScreenshotTime_ = now;
+    }
+}
+
+// Multi-format response parser - supports OpenAI, Qwen/DashScope, and other formats
+static std::string parseMultiFormatResponse(const std::string& response, bool debug) {
+    try {
+        json::Value root = json::parse(response);
+        
+        // Format 1: OpenAI standard (choices[0].message.content / tool_calls)
+        if (root.has("choices") && root["choices"].isArray() && root["choices"].size() > 0) {
+            const json::Value& choice = root["choices"][0];
+            if (choice.has("message")) {
+                const json::Value& message = choice["message"];
+                
+                // Check tool_calls (OpenAI format)
+                if (message.has("tool_calls") && message["tool_calls"].isArray() && message["tool_calls"].size() > 0) {
+                    const json::Value& toolCall = message["tool_calls"][0];
+                    if (toolCall.has("function")) {
+                        const json::Value& function = toolCall["function"];
+                        std::string toolName = function.has("name") ? function["name"].asString() : "";
+                        std::string arguments = function.has("arguments") ? function["arguments"].asString() : "{}";
+                        
+                        try {
+                            json::Value result;
+                            result["tool"] = toolName;
+                            result["params"] = json::parse(arguments);
+                            
+                            std::string toolCallJson = "```json\n" + json::serialize(result) + "\n```";
+                            if (debug) {
+                                std::cout << "[DEBUG] Detected OpenAI tool_call: " << toolName << std::endl;
+                            }
+                            return toolCallJson;
+                        } catch (const std::exception& e) {
+                            if (debug) {
+                                std::cerr << "[DEBUG] Failed to parse tool call: " << e.what() << std::endl;
+                            }
+                        }
+                    }
+                }
+                
+                // Return content
+                if (message.has("content") && message["content"].isString()) {
+                    return message["content"].asString();
+                }
+            }
+            
+            // Qwen/alternative format (choices[0].text or choices[0].content)
+            if (choice.has("text") && choice["text"].isString()) {
+                if (debug) {
+                    std::cout << "[DEBUG] Using text field (Qwen/alternative format)" << std::endl;
+                }
+                return choice["text"].asString();
+            }
+            
+            if (choice.has("content") && choice["content"].isString()) {
+                if (debug) {
+                    std::cout << "[DEBUG] Using content field (alternative format)" << std::endl;
+                }
+                return choice["content"].asString();
+            }
+        }
+        
+        // Format 2: DashScope (output.text / output.tool_calls)
+        if (root.has("output")) {
+            const json::Value& output = root["output"];
+            if (output.has("text") && output["text"].isString()) {
+                if (debug) {
+                    std::cout << "[DEBUG] Detected DashScope format" << std::endl;
+                }
+                return output["text"].asString();
+            }
+            if (output.has("tool_calls") && output["tool_calls"].isArray() && output["tool_calls"].size() > 0) {
+                if (debug) {
+                    std::cout << "[DEBUG] Detected DashScope tool_calls" << std::endl;
+                }
+                const json::Value& toolCall = output["tool_calls"][0];
+                if (toolCall.has("function")) {
+                    const json::Value& function = toolCall["function"];
+                    std::string toolName = function.has("name") ? function["name"].asString() : "";
+                    std::string arguments = function.has("arguments") ? function["arguments"].asString() : "{}";
+                    
+                    try {
+                        json::Value result;
+                        result["tool"] = toolName;
+                        result["params"] = json::parse(arguments);
+                        return "```json\n" + json::serialize(result) + "\n```";
+                    } catch (const std::exception& e) {
+                        if (debug) {
+                            std::cerr << "[DEBUG] Failed to parse DashScope tool call: " << e.what() << std::endl;
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Format 3: Simple formats (result / data / content / response)
+        if (root.has("result") && root["result"].isString()) {
+            if (debug) std::cout << "[DEBUG] Using result field" << std::endl;
+            return root["result"].asString();
+        }
+        
+        if (root.has("output") && root["output"].isString()) {
+            if (debug) std::cout << "[DEBUG] Using output field" << std::endl;
+            return root["output"].asString();
+        }
+        
+        if (root.has("data") && root["data"].isString()) {
+            if (debug) std::cout << "[DEBUG] Using data field" << std::endl;
+            return root["data"].asString();
+        }
+        
+        if (root.has("content") && root["content"].isString()) {
+            if (debug) std::cout << "[DEBUG] Using content field" << std::endl;
+            return root["content"].asString();
+        }
+        
+        if (root.has("response") && root["response"].isString()) {
+            if (debug) std::cout << "[DEBUG] Using response field" << std::endl;
+            return root["response"].asString();
+        }
+        
+        // Format 4: Nested data object
+        if (root.has("data") && root["data"].isObject() && root["data"].has("text")) {
+            if (debug) std::cout << "[DEBUG] Using data.text field" << std::endl;
+            return root["data"]["text"].asString();
+        }
+        
+        // Unrecognized format
+        if (debug) {
+            std::cerr << "\n========== UNRECOGNIZED FORMAT ==========" << std::endl;
+            std::cerr << "Response: " << response.substr(0, 1000) << std::endl;
+            std::cerr << "==========================================\n" << std::endl;
+        }
+        
+        return "";
+        
+    } catch (const std::exception& e) {
+        if (debug) {
+            std::cerr << "[DEBUG] JSON parse error: " << e.what() << std::endl;
+            std::cerr << "[DEBUG] Raw response: " << response.substr(0, 500) << std::endl;
+        }
+        return "";
+    }
+}
+
+std::string Agent::sendToAI() {
+    std::string requestBody = buildRequestJSON();
+    std::string response = http_.post(config_.baseURL, requestBody);
+    
+    if (response.empty()) {
+        if (config_.debug) {
+            std::cerr << "\n========== HTTP ERROR ==========" << std::endl;
+            std::cerr << "Error: " << http_.getLastError() << std::endl;
+            std::cerr << "URL: " << config_.baseURL << std::endl;
+            std::cerr << "================================\n" << std::endl;
+        }
+        return "";
+    }
+    
+    long statusCode = http_.getLastStatusCode();
+    if (statusCode != 200) {
+        if (config_.debug) {
+            std::cerr << "\n========== HTTP ERROR ==========" << std::endl;
+            std::cerr << "HTTP Status Code: " << statusCode << std::endl;
+            std::cerr << "URL: " << config_.baseURL << std::endl;
+            std::cerr << "Response: " << response << std::endl;
+            std::cerr << "================================\n" << std::endl;
+        }
+    }
+    
+    // Check for API error first
+    try {
+        json::Value root = json::parse(response);
+        
+        if (root.has("error")) {
+            if (config_.debug) {
+                std::cerr << "\n========== API ERROR ==========" << std::endl;
+                std::cerr << "HTTP Status Code: " << statusCode << std::endl;
+                std::cerr << "Error Details: " << std::endl;
+                
+                if (root["error"].isString()) {
+                    std::cerr << "  Message: " << root["error"].asString() << std::endl;
+                } else if (root["error"].isObject()) {
+                    const json::Value& errorObj = root["error"];
+                    if (errorObj.has("message")) {
+                        std::cerr << "  Message: " << errorObj["message"].asString() << std::endl;
+                    }
+                    if (errorObj.has("type")) {
+                        std::cerr << "  Type: " << errorObj["type"].asString() << std::endl;
+                    }
+                    if (errorObj.has("code")) {
+                        std::cerr << "  Code: " << errorObj["code"].asString() << std::endl;
+                    }
+                }
+                
+                std::cerr << "Full Response: " << response << std::endl;
+                std::cerr << "================================\n" << std::endl;
+            }
+            return "";
+        }
+    } catch (const std::exception& e) {
+        if (config_.debug) {
+            std::cerr << "[DEBUG] Error check parse failed: " << e.what() << std::endl;
+        }
+    }
+    
+    // Use multi-format parser
+    return parseMultiFormatResponse(response, config_.debug);
+}
+
+bool Agent::parseToolCall(const std::string& response, 
+                          std::string& toolName, 
+                          json::Value& params) {
+    size_t jsonStart = response.find("```json");
+    if (jsonStart == std::string::npos) {
+        jsonStart = response.find("{");
+        if (jsonStart == std::string::npos) return false;
+    } else {
+        jsonStart += 7;
+    }
+    
+    size_t jsonEnd = response.find("```", jsonStart);
+    if (jsonEnd == std::string::npos) {
+        jsonEnd = response.find("}", jsonStart);
+        if (jsonEnd == std::string::npos) return false;
+        jsonEnd++;
+    }
+    
+    std::string jsonStr = response.substr(jsonStart, jsonEnd - jsonStart);
+    
+    size_t start = jsonStr.find("{");
+    size_t end = jsonStr.rfind("}");
+    if (start == std::string::npos || end == std::string::npos) return false;
+    
+    jsonStr = jsonStr.substr(start, end - start + 1);
+    
+    try {
+        json::Value root = json::parse(jsonStr);
+        if (!root.has("tool")) return false;
+        
+        toolName = root["tool"].asString();
+        if (root.has("params")) {
+            params = root["params"];
+        }
+        
+        return true;
+    } catch (const std::exception& e) {
+        if (config_.debug) {
+            std::cerr << "Failed to parse tool call JSON: " << e.what() << std::endl;
+        }
+        return false;
+    }
+}
+
+void Agent::extractResponse(const std::string& response, 
+                            std::string& thinking, 
+                            std::string& finalResponse) {
+    size_t thinkStart = response.find("<thinking>");
+    size_t thinkEnd = response.find("</thinking>");
+    
+    if (thinkStart != std::string::npos && thinkEnd != std::string::npos) {
+        thinkStart += 10;
+        thinking = response.substr(thinkStart, thinkEnd - thinkStart);
+        finalResponse = response.substr(thinkEnd + 11);
+        
+        size_t start = finalResponse.find_first_not_of(" \t\n\r");
+        if (start != std::string::npos) {
+            finalResponse = finalResponse.substr(start);
+        }
+    } else {
+        finalResponse = response;
+    }
+}
+
+// ---- OpenAI function calling tool schema builders ----
+
+// Build a JSON-schema property definition
+static json::Value makeProperty(const std::string& type, const std::string& desc) {
+    json::Value p;
+    p["type"] = json::Value(type);
+    p["description"] = json::Value(desc);
+    return p;
+}
+
+// Build a single tool definition
+static json::Value makeTool(const std::string& name,
+                            const std::string& description,
+                            const json::Object& properties,
+                            const json::Array& required) {
+    json::Value fn;
+    fn["name"] = json::Value(name);
+    fn["description"] = json::Value(description);
+
+    json::Value params;
+    params["type"] = json::Value(std::string("object"));
+    params["properties"] = json::Value(properties);
+    if (!required.empty()) {
+        params["required"] = json::Value(required);
+    }
+    fn["parameters"] = params;
+
+    json::Value tool;
+    tool["type"] = json::Value(std::string("function"));
+    tool["function"] = fn;
+    return tool;
+}
+
+// Build the full tool list for the AI
+static json::Array buildToolList() {
+    json::Array tools;
+
+    // --- Terminal tools ---
+    {
+        json::Object p;
+        json::Array r;
+        tools.push_back(makeTool("terminal_create", "创建一个新的终端会话，返回终端ID", p, r));
+    }
+    {
+        json::Object p;
+        p["terminal_id"] = makeProperty("integer", "终端会话ID");
+        json::Array r;
+        r.push_back(json::Value(std::string("terminal_id")));
+        tools.push_back(makeTool("terminal_remove", "关闭指定终端会话", p, r));
+    }
+    {
+        json::Object p;
+        p["terminal_id"] = makeProperty("integer", "终端会话ID");
+        p["command"] = makeProperty("string", "要执行的命令");
+        json::Array r;
+        r.push_back(json::Value(std::string("terminal_id")));
+        r.push_back(json::Value(std::string("command")));
+        tools.push_back(makeTool("terminal_input", "向指定终端发送命令", p, r));
+    }
+    {
+        json::Object p;
+        p["terminal_id"] = makeProperty("integer", "终端会话ID");
+        json::Array r;
+        r.push_back(json::Value(std::string("terminal_id")));
+        tools.push_back(makeTool("terminal_output", "读取指定终端的输出缓冲区", p, r));
+    }
+
+    // --- Mouse tools ---
+    {
+        json::Object p;
+        p["x"] = makeProperty("integer", "屏幕X坐标");
+        p["y"] = makeProperty("integer", "屏幕Y坐标");
+        p["duration_ms"] = makeProperty("integer", "按下时长(毫秒)，默认100");
+        json::Array r;
+        r.push_back(json::Value(std::string("x")));
+        r.push_back(json::Value(std::string("y")));
+        tools.push_back(makeTool("mouse_click", "鼠标左键点击屏幕指定坐标", p, r));
+    }
+    {
+        json::Object p;
+        p["x1"] = makeProperty("integer", "起始X坐标");
+        p["y1"] = makeProperty("integer", "起始Y坐标");
+        p["x2"] = makeProperty("integer", "结束X坐标");
+        p["y2"] = makeProperty("integer", "结束Y坐标");
+        json::Array r;
+        r.push_back(json::Value(std::string("x1")));
+        r.push_back(json::Value(std::string("y1")));
+        r.push_back(json::Value(std::string("x2")));
+        r.push_back(json::Value(std::string("y2")));
+        tools.push_back(makeTool("mouse_drag", "鼠标按住拖动(带真实感移动轨迹)", p, r));
+    }
+
+    // --- Keyboard tools ---
+    {
+        json::Object p;
+        p["key"] = makeProperty("string", "按键名，如 'a', 'enter', 'esc', 'ctrl'");
+        p["duration_ms"] = makeProperty("integer", "按下时长(毫秒)，默认50");
+        json::Array r;
+        r.push_back(json::Value(std::string("key")));
+        tools.push_back(makeTool("key_press", "按下并释放一个按键", p, r));
+    }
+    {
+        json::Object p;
+        p["key1"] = makeProperty("string", "第一个按键，如 'ctrl'");
+        p["key2"] = makeProperty("string", "第二个按键，如 'c'");
+        p["duration_ms"] = makeProperty("integer", "按下时长(毫秒)，默认50");
+        json::Array r;
+        r.push_back(json::Value(std::string("key1")));
+        r.push_back(json::Value(std::string("key2")));
+        tools.push_back(makeTool("key_combo", "同时按下两个按键(组合键)", p, r));
+    }
+
+    // --- File system tools ---
+    {
+        json::Object p;
+        p["path"] = makeProperty("string", "文件路径");
+        json::Array r;
+        r.push_back(json::Value(std::string("path")));
+        tools.push_back(makeTool("file_create", "创建新文件", p, r));
+    }
+    {
+        json::Object p;
+        p["path"] = makeProperty("string", "文件夹路径");
+        json::Array r;
+        r.push_back(json::Value(std::string("path")));
+        tools.push_back(makeTool("folder_create", "创建新文件夹", p, r));
+    }
+    {
+        json::Object p;
+        p["path"] = makeProperty("string", "文件路径");
+        json::Array r;
+        r.push_back(json::Value(std::string("path")));
+        tools.push_back(makeTool("file_delete", "删除文件", p, r));
+    }
+    {
+        json::Object p;
+        p["path"] = makeProperty("string", "文件夹路径");
+        json::Array r;
+        r.push_back(json::Value(std::string("path")));
+        tools.push_back(makeTool("folder_delete", "删除文件夹", p, r));
+    }
+    {
+        json::Object p;
+        p["path"] = makeProperty("string", "文件路径");
+        json::Array r;
+        r.push_back(json::Value(std::string("path")));
+        tools.push_back(makeTool("file_info", "获取文件信息(大小、修改时间等)", p, r));
+    }
+    {
+        json::Object p;
+        p["path"] = makeProperty("string", "文件夹路径");
+        json::Array r;
+        r.push_back(json::Value(std::string("path")));
+        tools.push_back(makeTool("folder_info", "获取文件夹信息", p, r));
+    }
+    {
+        json::Object p;
+        p["path"] = makeProperty("string", "文件夹路径");
+        json::Array r;
+        r.push_back(json::Value(std::string("path")));
+        tools.push_back(makeTool("folder_list", "列出文件夹内容", p, r));
+    }
+    {
+        json::Object p;
+        p["path"] = makeProperty("string", "文件路径");
+        json::Array r;
+        r.push_back(json::Value(std::string("path")));
+        tools.push_back(makeTool("file_read", "读取文件内容", p, r));
+    }
+    {
+        json::Object p;
+        p["path"] = makeProperty("string", "文件路径");
+        p["content"] = makeProperty("string", "要写入的内容");
+        json::Array r;
+        r.push_back(json::Value(std::string("path")));
+        r.push_back(json::Value(std::string("content")));
+        tools.push_back(makeTool("file_write", "写入内容到文件(覆盖)", p, r));
+    }
+
+    return tools;
+}
+
+std::string Agent::buildRequestJSON() {
+    json::Value root;
+    root["messages"] = cache_.toJSON();
+    root["model"] = config_.model;
+    root["max_tokens"] = config_.maxTokens;
+    root["temperature"] = config_.temperature;
+    root["top_p"] = config_.topP;
+    // 把工具列表发给AI（OpenAI function calling 格式）
+    root["tools"] = buildToolList();
+    return json::serialize(root);
+}
+
+// ============ 记忆压缩功能 ============
+
+// 加载记忆压缩提示词模板（memory_prompt.md）
+bool Agent::loadMemoryPrompt(const std::string& filename) {
+    std::ifstream file(filename.c_str());
+    if (!file.is_open()) {
+        if (config_.debug) {
+            std::cerr << "Warning: memory_prompt.md not found, will use built-in template" << std::endl;
+        }
+        return false;
+    }
+    
+    std::stringstream ss;
+    ss << file.rdbuf();
+    file.close();
+    
+    memoryPromptTemplate_ = ss.str();
+    return true;
+}
+
+// 超过 token 限制时，把最旧的一半非 system 消息压缩成长期记忆
+void Agent::compressToMemory() {
+    // 未超限则不需要压缩
+    if (cache_.estimateTokens() <= config_.maxTokens) {
+        return;
+    }
+    
+    // 最多 8 轮压缩，防止死循环
+    for (int round = 0; round < 8; round++) {
+        if (cache_.estimateTokens() <= config_.maxTokens) {
+            return;
+        }
+        
+        const std::vector<Message>& messages = cache_.getMessages();
+        
+        // 统计非 system 消息数量
+        size_t nonSystemCount = 0;
+        for (size_t i = 0; i < messages.size(); i++) {
+            if (messages[i].role != "system") {
+                nonSystemCount++;
+            }
+        }
+        
+        if (nonSystemCount == 0) {
+            return;  // 没有可压缩的对话
+        }
+        
+        // 取最旧一半（至少 1 条）
+        size_t count = nonSystemCount / 2;
+        if (count < 1) count = 1;
+        
+        // 取出最旧的非 system 消息
+        std::vector<Message> oldMessages = cache_.extractOldMessages(count);
+        if (oldMessages.empty()) {
+            return;
+        }
+        
+        if (config_.debug) {
+            std::cout << "[Compressing " << oldMessages.size() << " old messages into memory...]" << std::endl;
+        }
+        
+        // 拼接上下文
+        std::string context;
+        for (size_t i = 0; i < oldMessages.size(); i++) {
+            std::string role = oldMessages[i].role;
+            if (role == "tool" && !oldMessages[i].toolName.empty()) {
+                role = "tool(" + oldMessages[i].toolName + ")";
+            }
+            
+            std::string content = oldMessages[i].content;
+            if (content.size() > 2000) {
+                content = content.substr(0, 2000);
+            }
+            
+            context += "[" + role + "]: " + content + "\n";
+        }
+        
+        // 构建压缩请求的 system 提示词
+        std::string sysPrompt;
+        if (!memoryPromptTemplate_.empty()) {
+            sysPrompt = memoryPromptTemplate_;
+            const std::string placeholder = "${content}";
+            size_t pos = sysPrompt.find(placeholder);
+            if (pos != std::string::npos) {
+                sysPrompt.replace(pos, placeholder.size(), context);
+            } else {
+                sysPrompt += "\n上下文:\n" + context;
+            }
+        } else {
+            sysPrompt = std::string(
+                "你是对话记忆压缩助手。请把下面的对话上下文压缩成简洁的长期记忆。\n"
+                "要求：\n"
+                "1. 保留重要事实、用户的要求、偏好、任务进展和已做决策；\n"
+                "2. 省略闲聊、重复内容和已完成的临时细节；\n"
+                "3. 时间越靠前的信息权重越小，越新的信息权重越大；\n"
+                "4. 禁止包含涉黄、涉政、涉暴、涉恐等违法内容；\n"
+                "5. 只输出记忆内容本身，不要任何解释或客套话。\n\n"
+                "上下文:\n") + context;
+        }
+        
+        // 构建压缩请求（不带 tools，让 AI 直接输出记忆文本）
+        json::Value root;
+        json::Array arr;
+        
+        json::Object sysObj;
+        sysObj["role"] = json::Value(std::string("system"));
+        sysObj["content"] = json::Value(sysPrompt);
+        arr.push_back(json::Value(sysObj));
+        
+        std::string existingMemory = cache_.getMemory();
+        json::Object userObj;
+        userObj["role"] = json::Value(std::string("user"));
+        if (existingMemory.empty()) {
+            userObj["content"] = json::Value(std::string("请把上面的上下文压缩成长期记忆。"));
+        } else {
+            userObj["content"] = json::Value(std::string(
+                "下面是已有的长期记忆，请结合上面的新上下文合并更新（输出合并后的完整记忆）：\n\n"
+                "已有记忆：\n") + existingMemory);
+        }
+        arr.push_back(json::Value(userObj));
+        
+        root["messages"] = json::Value(arr);
+        root["model"] = json::Value(config_.model);
+        root["max_tokens"] = json::Value(6000);
+        root["temperature"] = json::Value(0.3);
+        
+        std::string requestBody = json::serialize(root);
+        std::string response = http_.post(config_.baseURL, requestBody);
+        
+        if (response.empty()) {
+            if (config_.debug) {
+                std::cerr << "[Memory compression request failed, falling back to trimming]" << std::endl;
+            }
+            break;
+        }
+        
+        std::string memory = parseMultiFormatResponse(response, config_.debug);
+        if (memory.empty()) {
+            if (config_.debug) {
+                std::cerr << "[Memory compression returned empty result, falling back to trimming]" << std::endl;
+            }
+            break;
+        }
+        
+        // 保存记忆
+        cache_.setMemory(memory);
+        if (config_.debug) {
+            std::cout << "[Memory updated (" << memory.size() << " chars)]" << std::endl;
+        }
+    }
+    
+    // 兜底：压缩失败或仍超限时，简单裁剪最旧消息保命
+    cache_.trimToTokenLimit(config_.maxTokens);
+}

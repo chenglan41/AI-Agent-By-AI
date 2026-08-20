@@ -1,0 +1,42 @@
+# ===== 构建产物 =====
+*.exe
+*.o
+*.obj
+
+# ===== curl 依赖库（体积大，重新下载即可） =====
+include/
+lib/
+dep/
+bin/
+docs/
+
+# ===== curl 附带文件 =====
+BUILD-*.txt
+BUILD-*.url
+COPYING.txt
+RELEASE-NOTES.txt
+README.txt
+mk-ca-bundle.pl
+curl-ca-bundle.crt
+libcurl-x64.dll
+
+# ===== 敏感配置（含真实 API Key） =====
+config.json
+
+# ===== 运行时生成 / 隐私 =====
+content.txt
+memory_prompt.md
+
+# ===== 历史废弃文件 =====
+agent.md
+agent_new.cpp
+multi_format_parser.cpp
+patch_sendToAI.cpp
+1.txt
+screenshot.png
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.vs/
+.idea/
+Thumbs.db
