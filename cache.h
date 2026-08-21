@@ -39,6 +39,7 @@ struct Message {
     std::string role; // "system", "user", "assistant", "tool"
     std::string content;  // simple text content (for backward compatibility)
     std::string toolName; // for "tool" role messages: the tool function name
+    std::string reasoning; // assistant 消息的思考链（DeepSeek 思考模式必须回传）
     std::vector<ContentItem> contentItems;  // multi-modal content
     
     Message() {}
@@ -60,7 +61,8 @@ public:
     bool save(const std::string& filename);
     
     // Add message to cache (text only)
-    void addMessage(const std::string& role, const std::string& content);
+    // reasoning: assistant 消息的思考链（可空，思考模式下必须回传）
+    void addMessage(const std::string& role, const std::string& content, const std::string& reasoning = "");
     
     // Add tool result message (role="tool", with tool name)
     void addToolResult(const std::string& toolName, const std::string& content);
@@ -78,7 +80,9 @@ public:
     void clear();
     
     // Get all messages as JSON array (OpenAI vision API format)
-    json::Value toJSON() const;
+    // includeReasoning: 思考模式下输出 reasoning_content 字段，
+    //                  并过滤没有思考链的旧 assistant 消息（DeepSeek 会 400）
+    json::Value toJSON(bool includeReasoning = false) const;
     
     // Estimate token count (rough estimate)
     int estimateTokens() const;

@@ -102,6 +102,26 @@ std::string KeyboardController::press(const std::string& key, int duration_ms) {
 }
 
 std::string KeyboardController::combo(const std::string& key1, const std::string& key2, int duration_ms) {
+    // ========== 防自杀硬拦截（第一层） ==========
+    // ctrl+c / ctrl+break / ctrl+pause 会向控制台进程组发送中断信号，
+    // 直接杀死 Agent 自身进程，导致任务中断。
+    // 代码层硬拦截：无论模型怎么调用，这类组合键一律拒绝执行，
+    // 并提示改用 terminal_remove 或向终端发送 exit。
+    std::string up1 = key1;
+    std::string up2 = key2;
+    std::transform(up1.begin(), up1.end(), up1.begin(), ::toupper);
+    std::transform(up2.begin(), up2.end(), up2.begin(), ::toupper);
+    
+    bool hasCtrl = (up1 == "CTRL" || up1 == "CONTROL" || up2 == "CTRL" || up2 == "CONTROL");
+    bool hasKill = (up1 == "C" || up2 == "C" ||
+                    up1 == "BREAK" || up2 == "BREAK" ||
+                    up1 == "PAUSE" || up2 == "PAUSE");
+    if (hasCtrl && hasKill) {
+        return "Blocked: this key combo (ctrl+c / ctrl+break / ctrl+pause) would kill the Agent process itself. "
+               "To stop a program inside a terminal, use terminal_remove to close that terminal, "
+               "or send the 'exit' command via terminal_input instead.";
+    }
+    
     WORD vk1 = keyToVK(key1);
     WORD vk2 = keyToVK(key2);
     

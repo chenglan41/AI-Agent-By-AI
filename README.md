@@ -16,6 +16,7 @@
 - 💬 **记忆消息**：支持持久记忆，跨会话保持上下文
 - 🖼️ **多模态**：支持图片输入（如截图），配合视觉模型使用
 - 💭 **思考链输出**：可在控制台查看模型的思考过程（reasoning_content）
+- 🛡️ **防自杀保护**：三层防护拦截 Ctrl+C / Ctrl+Break 中断信号与自杀组合键，防止 Agent 误杀自身进程
 - 🪶 **轻量**：纯 C++ 实现，仅依赖 curl，编译产物小巧
 
 ## 🛠️ 工具列表
@@ -27,6 +28,16 @@
 | 键盘 | `key_press` / `key_combo` |
 | 文件 | `file_create` / `file_delete` / `file_read` / `file_write` / `file_info` |
 | 文件夹 | `folder_create` / `folder_delete` / `folder_list` / `folder_info` |
+
+## 🛡️ 防自杀保护
+
+Agent 拥有模拟键盘的能力，为避免其误发 Ctrl+C 等中断信号杀死自身进程，内置三层防护：
+
+1. **键盘层**：`key_combo` 硬拦截 `ctrl+c` / `ctrl+break` / `ctrl+pause` 组合键，拒绝执行并返回提示
+2. **进程层**：程序注册 `SetConsoleCtrlHandler`，忽略 Ctrl+C / Ctrl+Break 控制台中断信号
+3. **提示词层**：工具描述中写明安全红线，引导模型中断程序时使用 `terminal_remove` 或向终端发送 `exit`
+
+> 💡 运行 Agent 的控制台窗口按 Ctrl+C 不会退出（会被拦截），请使用 `exit` / `quit` 命令正常退出；关闭窗口仍可随时退出。
 
 ## 🔧 编译
 

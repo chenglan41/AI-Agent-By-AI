@@ -138,6 +138,10 @@ void Agent::run() {
         std::string input;
         std::getline(std::cin, input);
         
+        if (!std::cin) {
+            break;  // EOF 或读取失败，退出循环，防止死循环刷屏
+        }
+        
 #ifdef _WIN32
         if (!input.empty() && !isUTF8(input)) {
             input = GBKToUTF8(input);
@@ -208,6 +212,7 @@ void Agent::processInput(const std::string& userInput) {
         if (parseToolCall(response, toolName, params)) {
             if (config_.debug) {
                 std::cout << "[Tool Call]: " << toolName << std::endl;
+                std::cout << "[Tool Params]: " << json::serialize(params) << std::endl;
             }
             
             // Execute tool
@@ -225,7 +230,12 @@ void Agent::processInput(const std::string& userInput) {
             }
             
             // Add assistant message and tool result (role="tool") to cache
-            cache_.addMessage("assistant", response);
+            // 思考链（reasoning_content）一并存入，思考模式下 DeepSeek 要求回传
+            // 存储前用解包后的干净参数重新打包，避免 content.txt 累积嵌套的包装格式（格式中毒源头）
+            json::Value storeObj;
+            storeObj["tool"] = json::Value(toolName);
+            storeObj["params"] = params;
+            cache_.addMessage("assistant", "```json\n" + json::serialize(storeObj) + "\n```", lastThinking_);
             cache_.addToolResult(toolName, result);
             
             iterations++;
@@ -234,7 +244,7 @@ void Agent::processInput(const std::string& userInput) {
         
         // No tool call, display final response
         if (!finalResponse.empty()) {
-            cache_.addMessage("assistant", finalResponse);
+            cache_.addMessage("assistant", finalResponse, lastThinking_);
             
 #ifdef _WIN32
             std::string displayResponse = finalResponse;
@@ -315,7 +325,15 @@ static std::string parseMultiFormatResponse(const std::string& response, bool de
                             return toolCallJson;
                         } catch (const std::exception& e) {
                             if (debug) {
-                                std::cerr << "[DEBUG] Failed to parse tool call: " << e.what() << std::endl;
+                                std::cerr << "[DEBUG] Failed to parse tool call arguments (tool=" << toolName << "): " << e.what() << std::endl;
+                            }
+                            // 降级：arguments 解析失败时用空参数发起工具调用，
+                            // 让工具返回缺参错误引导模型重试；不再落到 content 分支导致 Empty response
+                            if (!toolName.empty()) {
+                                json::Value result;
+                                result["tool"] = toolName;
+                                result["params"] = json::parse("{}");
+                                return "```json\n" + json::serialize(result) + "\n```";
                             }
                         }
                     }
@@ -369,7 +387,14 @@ static std::string parseMultiFormatResponse(const std::string& response, bool de
                         return "```json\n" + json::serialize(result) + "\n```";
                     } catch (const std::exception& e) {
                         if (debug) {
-                            std::cerr << "[DEBUG] Failed to parse DashScope tool call: " << e.what() << std::endl;
+                            std::cerr << "[DEBUG] Failed to parse DashScope tool call arguments (tool=" << toolName << "): " << e.what() << std::endl;
+                        }
+                        // 降级：同 OpenAI 分支，避免解析失败导致 Empty response
+                        if (!toolName.empty()) {
+                            json::Value result;
+                            result["tool"] = toolName;
+                            result["params"] = json::parse("{}");
+                            return "```json\n" + json::serialize(result) + "\n```";
                         }
                     }
                 }
@@ -591,6 +616,16 @@ bool Agent::parseToolCall(const std::string& response,
             params = root["params"];
         }
         
+        // 兼容"格式中毒"：模型若把 {"tool":..., "params":{...}} 包装格式整个塞进参数，
+        // 这里自动解包取出内层真实参数（最多解 3 层，防极端嵌套）
+        for (int depth = 0; depth < 3; depth++) {
+            if (params.isObject() && params.has("params") && params["params"].isObject()) {
+                params = params["params"];
+            } else {
+                break;
+            }
+        }
+        
         return true;
     } catch (const std::exception& e) {
         if (config_.debug) {
@@ -654,6 +689,11 @@ static json::Value makeTool(const std::string& name,
 }
 
 // Build the full tool list for the AI
+// ========== 工具使用规范（随 tools 一起发给模型，每次请求都可见） ==========
+// 1. arguments 只填参数对象本身（如 {"terminal_id":1}），严禁套 {"tool":...} 外层包装；
+// 2. 【安全红线】禁止 key_combo 发出 ctrl+c / ctrl+break / ctrl+pause 自杀组合键，
+//    中断终端程序一律用 terminal_remove 或向终端发送 exit；
+// 3. terminal_id 必须使用 terminal_create 返回的 ID，禁止编造。
 static json::Array buildToolList() {
     json::Array tools;
 
@@ -661,14 +701,14 @@ static json::Array buildToolList() {
     {
         json::Object p;
         json::Array r;
-        tools.push_back(makeTool("terminal_create", "创建一个新的终端会话，返回终端ID", p, r));
+        tools.push_back(makeTool("terminal_create", "创建一个新的终端会话并返回终端ID。请务必记住返回的ID，后续 terminal_input、terminal_output、terminal_remove 都需要传入该ID。注意：arguments 里直接填参数本身（如 {}），不要套 {\"tool\":...} 外层包装", p, r));
     }
     {
         json::Object p;
         p["terminal_id"] = makeProperty("integer", "终端会话ID");
         json::Array r;
         r.push_back(json::Value(std::string("terminal_id")));
-        tools.push_back(makeTool("terminal_remove", "关闭指定终端会话", p, r));
+        tools.push_back(makeTool("terminal_remove", "关闭指定终端会话。arguments 只填参数本身，如 {\"terminal_id\":1}", p, r));
     }
     {
         json::Object p;
@@ -677,14 +717,14 @@ static json::Array buildToolList() {
         json::Array r;
         r.push_back(json::Value(std::string("terminal_id")));
         r.push_back(json::Value(std::string("command")));
-        tools.push_back(makeTool("terminal_input", "向指定终端发送命令", p, r));
+        tools.push_back(makeTool("terminal_input", "向指定终端发送一条命令并执行。terminal_id 是 terminal_create 返回的ID。arguments 只填参数本身，如 {\"terminal_id\":1,\"command\":\"dir\"}。需要中断终端中正在运行的程序时，请发送 exit 或用 terminal_remove，禁止发送 ctrl+c", p, r));
     }
     {
         json::Object p;
         p["terminal_id"] = makeProperty("integer", "终端会话ID");
         json::Array r;
         r.push_back(json::Value(std::string("terminal_id")));
-        tools.push_back(makeTool("terminal_output", "读取指定终端的输出缓冲区", p, r));
+        tools.push_back(makeTool("terminal_output", "读取指定终端的输出缓冲区。若还没有终端，必须先调用 terminal_create 创建并获取终端ID。arguments 只填参数本身，如 {\"terminal_id\":1}", p, r));
     }
 
     // --- Mouse tools ---
@@ -719,17 +759,17 @@ static json::Array buildToolList() {
         p["duration_ms"] = makeProperty("integer", "按下时长(毫秒)，默认50");
         json::Array r;
         r.push_back(json::Value(std::string("key")));
-        tools.push_back(makeTool("key_press", "按下并释放一个按键", p, r));
+        tools.push_back(makeTool("key_press", "按下并释放一个按键（单键）。禁止用它配合其他按键模拟 ctrl+c 自杀组合键", p, r));
     }
     {
         json::Object p;
         p["key1"] = makeProperty("string", "第一个按键，如 'ctrl'");
-        p["key2"] = makeProperty("string", "第二个按键，如 'c'");
+        p["key2"] = makeProperty("string", "第二个按键，如 'v'");
         p["duration_ms"] = makeProperty("integer", "按下时长(毫秒)，默认50");
         json::Array r;
         r.push_back(json::Value(std::string("key1")));
         r.push_back(json::Value(std::string("key2")));
-        tools.push_back(makeTool("key_combo", "同时按下两个按键(组合键)", p, r));
+        tools.push_back(makeTool("key_combo", "同时按下两个按键(组合键)。【安全红线】严禁组合出 ctrl+c、ctrl+break、ctrl+pause：会向控制台发送中断信号杀死 Agent 自身进程。需要中断终端里的程序时改用 terminal_remove 关闭终端，或向终端发送 exit 命令。arguments 只填参数本身，如 {\"key1\":\"ctrl\",\"key2\":\"v\"}", p, r));
     }
 
     // --- File system tools ---
@@ -804,7 +844,8 @@ static json::Array buildToolList() {
 
 std::string Agent::buildRequestJSON() {
     json::Value root;
-    root["messages"] = cache_.toJSON();
+    // 思考模式开启时回传历史 assistant 消息的 reasoning_content（DeepSeek 必需）
+    root["messages"] = cache_.toJSON(config_.enableThinking);
     root["model"] = config_.model;
     root["max_tokens"] = config_.maxTokens;
     root["temperature"] = config_.temperature;

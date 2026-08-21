@@ -1,5 +1,55 @@
 # 更新日志
 
+## [1.2.4] - 2026-08-21
+
+### 修复
+
+- 修复 Agent 自杀问题：模型曾自主调用 `key_combo` 发出 ctrl+c，向控制台发送中断信号（^C），杀死 Agent 自身进程。三层防护：
+  - `KeyboardController::combo`：代码层硬拦截 ctrl+c / ctrl+break / ctrl+pause 组合键，拒绝执行并返回提示（改用 terminal_remove 或向终端发送 exit）
+  - `main.cpp`：注册 `SetConsoleCtrlHandler`，忽略 CTRL_C_EVENT / CTRL_BREAK_EVENT 中断信号，进程不再被杀（关窗口退出不受影响）
+  - `buildToolList`：新增"工具使用规范"注释，key_combo / key_press / terminal_input 描述写入安全红线与规范用法（严禁自杀组合键、中断程序用 terminal_remove 或 exit）
+- 清空 content.txt，移除记录模型发出 ctrl+c 自杀行为的历史消息，防止模型模仿
+
+### 其他
+
+- 更新 README.md：功能特性新增「防自杀保护」，并新增「🛡️ 防自杀保护」章节说明三层防护原理与退出方式
+
+## [1.2.3] - 2026-08-21
+
+### 修复
+
+- 修复工具调用参数"格式中毒"连环错误（模型把 `{"tool":...,"params":...}` 包装格式塞进原生 tool_calls 的 arguments，导致参数层层嵌套、`Missing terminal_id` / `Unknown tool` / `Invalid JSON` 连环报错）：
+  - `Cache::extractToolCallFromText`：回传 API 的 arguments 现在只放参数对象本身，不再包含 tool/params 包装；对历史嵌套数据自动解包（最多 3 层）
+  - `Agent::parseToolCall`：解析出的 params 若嵌套包装格式，自动逐层解包取出真实参数
+  - `parseMultiFormatResponse`：tool_calls 的 arguments 解析失败时，降级为空参数工具调用（让工具报缺参引导模型重试），不再一路落空导致 Empty response
+  - 所有工具描述统一追加格式提醒："调用时 arguments 直接填写参数对象本身，不要包含 tool 名称或任何包装格式"
+  - 清空 content.txt 中被污染的旧消息（含占位符模板残留）
+
+### 变更
+
+- 终端工具描述强化：terminal_create 强调"请务必记住返回的 ID"；terminal_input/output 说明 terminal_id 来源
+- `terminal_output` 未传 terminal_id 时自动使用唯一活动终端（无终端时返回提示引导先创建）
+
+## [1.2.2] - 2026-08-21
+
+### 修复
+
+- 修复 DeepSeek 思考模式报 400 `The reasoning_content in the thinking mode must be passed back to the API`：
+  - `Message` 结构新增 `reasoning` 字段，assistant 消息的思考链随缓存一起保存/加载
+  - `content.txt` 中思考链以 `[REASONING]...[/REASONING]` 块存储（位于正文之前）
+  - `Cache::toJSON(bool includeReasoning)`：思考模式开启时，assistant 消息（含 tool_calls 格式）自动回传 `reasoning_content` 字段
+  - `buildRequestJSON()` 按 `config_.enableThinking` 决定是否回传思考链
+  - 思考链计入 token 估算（防止缓存超限）
+
+## [1.2.1] - 2026-08-21
+
+### 修复
+
+- 修复 DeepSeek 报 400 `missing field 'tool_call_id'` 的问题：
+  - `Cache::toJSON()` 现在会把后面紧邻 tool 消息、且文本中包含工具调用 JSON 的 assistant 消息转换为 OpenAI `tool_calls` 格式（id 形如 `call_0`、`call_1`…）
+  - 与 assistant 配对的 tool 消息输出 `tool_call_id` 字段，与前面的 tool_calls 对应
+  - 孤立（无配对）的 tool 消息自动降级为 user 文本，避免 API 校验报错
+
 ## [1.2.0] - 2026-08-21
 
 ### 新增

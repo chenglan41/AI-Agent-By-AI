@@ -30,8 +30,16 @@ std::string ToolDispatcher::execute(const std::string& toolName, const json::Val
         return terminalMgr_.inputProcess(id, cmd);
     }
     if (toolName == "terminal_output") {
-        if (!params.has("terminal_id")) return "Missing terminal_id";
-        int id = params["terminal_id"].asInt();
+        int id;
+        if (!params.has("terminal_id")) {
+            // 兜底：模型未传 terminal_id 时，自动使用唯一的活动终端
+            id = terminalMgr_.getFirstSessionId();
+            if (id < 0) {
+                return "Missing terminal_id: 尚未创建任何终端，请先调用 terminal_create 创建终端";
+            }
+        } else {
+            id = params["terminal_id"].asInt();
+        }
         return terminalMgr_.outputProcess(id);
     }
     

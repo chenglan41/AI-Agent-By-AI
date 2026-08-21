@@ -260,3 +260,8 @@ std::string TerminalManager::outputProcess(int terminalId) {
     }
     return GBKToUTF8(session.buffer);
 }
+
+int TerminalManager::getFirstSessionId() const {
+    if (sessions_.empty()) return -1;
+    return sessions_.begin()->first;
+}

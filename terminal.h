@@ -44,6 +44,9 @@ public:
     
     // Get terminal output buffer
     std::string outputProcess(int terminalId);
+    
+    // Get first session id (-1 if no session exists)
+    int getFirstSessionId() const;
 
 private:
     std::map<int, TerminalSession> sessions_;

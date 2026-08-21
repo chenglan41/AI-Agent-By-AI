@@ -6,6 +6,20 @@
 #include "json.h"
 #include "agent.h"
 
+#ifdef _WIN32
+#include <windows.h>
+
+// ========== 防自杀第二层：忽略 Ctrl+C / Ctrl+Break 控制台事件 ==========
+// 即使键盘注入意外发出了 Ctrl+C，也拦截中断信号，不让 Agent 进程被杀。
+// 用户仍可正常输入 exit / quit 退出；CTRL_CLOSE_EVENT（关窗口）不拦截。
+static BOOL WINAPI ConsoleCtrlHandler(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) {
+        return TRUE;  // 拦截中断信号，不终止进程
+    }
+    return FALSE;
+}
+#endif
+
 // Load configuration from JSON file
 bool loadConfig(const std::string& filename, AgentConfig& config) {
     std::ifstream file(filename.c_str());
@@ -80,6 +94,11 @@ bool loadConfig(const std::string& filename, AgentConfig& config) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    // 防自杀第二层：注册控制台事件处理器，拦截 Ctrl+C / Ctrl+Break 中断信号
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+#endif
+
     std::cout << "AI Agent - Starting up..." << std::endl;
     
     // Load configuration - 使用当前目录下的 config.json

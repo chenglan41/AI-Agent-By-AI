@@ -11,6 +11,8 @@ static const std::string ROLE_PREFIX = "[ROLE:";
 static const std::string ROLE_SUFFIX = "]\n";
 static const std::string IMAGE_PREFIX = "[IMAGE:";
 static const std::string IMAGE_SUFFIX = "]\n";
+static const std::string REASONING_BEGIN = "[REASONING]";
+static const std::string REASONING_END = "[/REASONING]";
 
 // 去掉 data URL 前缀（"data:image/jpeg;base64," 等），只保留纯 base64。
 // 用最后一个逗号定位，可兼容双重前缀的旧坏数据。
@@ -22,6 +24,76 @@ static std::string stripDataUrlPrefix(const std::string& data) {
         }
     }
     return data;
+}
+
+// 去掉字符串前后的空白字符（空格、制表符、换行、回车）
+static std::string trimWhitespace(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\n\r");
+    if (start == std::string::npos) return "";
+    size_t end = s.find_last_not_of(" \t\n\r");
+    return s.substr(start, end - start + 1);
+}
+
+// 从 assistant 消息文本中提取工具调用信息
+// 支持格式: ```json\n{"tool":"xxx","params":{...}}\n``` 或裸 {...}
+// 成功返回 true，并输出 toolName、arguments（JSON 字符串）和去掉工具调用块后的剩余文本
+static bool extractToolCallFromText(const std::string& text, std::string& toolName,
+                                    std::string& arguments, std::string& restText) {
+    size_t fenceStart = text.find("```json");
+    size_t jsonStart;
+    size_t jsonEnd;
+    size_t fenceEnd = std::string::npos;
+    
+    if (fenceStart != std::string::npos) {
+        // 有代码块标记：找 { 和闭合的 ```
+        jsonStart = text.find("{", fenceStart + 7);
+        if (jsonStart == std::string::npos) return false;
+        jsonEnd = text.find("```", jsonStart);
+        if (jsonEnd == std::string::npos) return false;
+        fenceEnd = jsonEnd + 3;
+        restText = text.substr(0, fenceStart) + text.substr(fenceEnd);
+    } else {
+        // 无代码块标记：找第一个 { 到最后一个 }
+        jsonStart = text.find("{");
+        if (jsonStart == std::string::npos) return false;
+        jsonEnd = text.rfind("}");
+        if (jsonEnd == std::string::npos || jsonEnd <= jsonStart) return false;
+        jsonEnd++;
+        restText = text.substr(0, jsonStart) + text.substr(jsonEnd);
+    }
+    
+    std::string jsonStr = text.substr(jsonStart, jsonEnd - jsonStart);
+    size_t s = jsonStr.find("{");
+    size_t e = jsonStr.rfind("}");
+    if (s == std::string::npos || e == std::string::npos || e <= s) return false;
+    jsonStr = jsonStr.substr(s, e - s + 1);
+    
+    try {
+        json::Value root = json::parse(jsonStr);
+        if (!root.has("tool")) return false;
+        toolName = root["tool"].asString();
+        
+        // arguments 只放纯参数对象（OpenAI function calling 要求 arguments 就是参数本身）。
+        // 之前把 {"tool":...,"params":...} 整体当 arguments 会污染上下文，
+        // 导致模型在原生 tool_calls 里照抄包装格式。
+        json::Value argsObj;
+        if (root.has("params")) {
+            argsObj = root["params"];
+            // 若参数里又被塞了包装格式，解包嵌套的 params（最多 3 层）
+            int depth = 0;
+            while (argsObj.isObject() && argsObj.has("params") &&
+                   argsObj["params"].isObject() && depth < 3) {
+                json::Value inner = argsObj["params"];
+                argsObj = inner;
+                depth++;
+            }
+        }
+        arguments = json::serialize(argsObj);
+        restText = trimWhitespace(restText);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 Cache::Cache() {
@@ -84,6 +156,23 @@ bool Cache::load(const std::string& filename) {
             m.role = role;
         }
         
+        // 解析 assistant 的思考链块 [REASONING]...[/REASONING]（思考模式回传必需）
+        if (msgContent.compare(0, REASONING_BEGIN.size(), REASONING_BEGIN) == 0) {
+            size_t reasonBodyStart = REASONING_BEGIN.size();
+            if (reasonBodyStart < msgContent.size() && msgContent[reasonBodyStart] == '\n') {
+                reasonBodyStart++;
+            }
+            size_t reasonEndMark = msgContent.find("\n" + REASONING_END, reasonBodyStart);
+            if (reasonEndMark != std::string::npos) {
+                m.reasoning = msgContent.substr(reasonBodyStart, reasonEndMark - reasonBodyStart);
+                msgContent = msgContent.substr(reasonEndMark + REASONING_END.size() + 1);
+                // 去掉开头的换行
+                if (!msgContent.empty() && msgContent[0] == '\n') {
+                    msgContent = msgContent.substr(1);
+                }
+            }
+        }
+        
         // 检查是否包含图片
         size_t imgPos = msgContent.find(IMAGE_PREFIX);
         if (imgPos != std::string::npos) {
@@ -128,6 +217,10 @@ bool Cache::load(const std::string& filename) {
                     m.role = msg["role"].asString();
                     if (m.role == "tool" && msg.has("name")) {
                         m.toolName = msg["name"].asString();
+                    }
+                    if (m.role == "assistant" && msg.has("reasoning_content")
+                        && msg["reasoning_content"].isString()) {
+                        m.reasoning = msg["reasoning_content"].asString();
                     }
                     
                     if (msg.has("content")) {
@@ -205,6 +298,12 @@ bool Cache::save(const std::string& filename) {
                 }
             }
         } else {
+            // assistant 消息带思考链时，先写 reasoning 块再写正文
+            if (msg.role == "assistant" && !msg.reasoning.empty()) {
+                file << REASONING_BEGIN << "\n"
+                     << msg.reasoning << "\n"
+                     << REASONING_END << "\n";
+            }
             file << msg.content << "\n";
         }
         
@@ -216,7 +315,8 @@ bool Cache::save(const std::string& filename) {
     return true;
 }
 
-void Cache::addMessage(const std::string& role, const std::string& content) {
+void Cache::addMessage(const std::string& role, const std::string& content,
+                       const std::string& reasoning) {
     // 用户消息：如果有待发送的截图，合并成一条多模态消息
     if (role == "user" && !pendingScreenshots_.empty()) {
         Message msg;
@@ -237,7 +337,11 @@ void Cache::addMessage(const std::string& role, const std::string& content) {
         return;
     }
     
-    messages_.push_back(Message(role, content));
+    Message msg(role, content);
+    if (role == "assistant") {
+        msg.reasoning = reasoning;
+    }
+    messages_.push_back(msg);
 }
 
 void Cache::addToolResult(const std::string& toolName, const std::string& content) {
@@ -276,26 +380,105 @@ void Cache::clear() {
     pendingScreenshots_.clear();
 }
 
-json::Value Cache::toJSON() const {
+json::Value Cache::toJSON(bool includeReasoning) const {
     json::Array arr;
-    for (const auto& msg : messages_) {
+    int callSeq = 0;
+    
+    for (size_t i = 0; i < messages_.size(); i++) {
+        const Message& msg = messages_[i];
+        
+        // assistant 消息：如果后面紧邻 tool 消息且文本中能提取出工具调用，
+        // 输出 OpenAI tool_calls 格式，并给紧邻的 tool 消息生成配对的 tool_call_id
+        if (msg.role == "assistant") {
+            // 思考模式下 DeepSeek 要求每条 assistant 消息都回传 reasoning_content，
+            // 缺思考链的旧消息（如关闭思考模式时期产生的）直接跳过，避免 400。
+            // 其后紧跟的 tool 消息会作为孤立 tool 降级为 user 文本，上下文不丢。
+            if (includeReasoning && msg.reasoning.empty()) {
+                continue;
+            }
+            
+            bool nextIsTool = (i + 1 < messages_.size() && messages_[i + 1].role == "tool");
+            std::string toolName, arguments, restText;
+            bool extracted = nextIsTool && extractToolCallFromText(msg.content, toolName, arguments, restText);
+            
+            if (extracted) {
+                std::string callId = "call_" + std::to_string(callSeq++);
+                
+                json::Object aObj;
+                aObj["role"] = json::Value(std::string("assistant"));
+                // DeepSeek 对带 tool_calls 的 assistant 消息更认 content: null（无正文时）
+                if (restText.empty()) {
+                    aObj["content"] = json::Value(nullptr);
+                } else {
+                    aObj["content"] = json::Value(restText);
+                }
+                // 思考模式：必须回传 reasoning_content，否则 DeepSeek 400
+                if (includeReasoning && !msg.reasoning.empty()) {
+                    aObj["reasoning_content"] = json::Value(msg.reasoning);
+                }
+                
+                json::Object fnObj;
+                fnObj["name"] = json::Value(toolName);
+                fnObj["arguments"] = json::Value(arguments);
+                
+                json::Object tcObj;
+                tcObj["id"] = json::Value(callId);
+                tcObj["type"] = json::Value(std::string("function"));
+                tcObj["function"] = json::Value(fnObj);
+                
+                json::Array tcs;
+                tcs.push_back(json::Value(tcObj));
+                aObj["tool_calls"] = json::Value(tcs);
+                arr.push_back(json::Value(aObj));
+                
+                // 紧邻的 tool 消息：输出 role=tool + tool_call_id（DeepSeek 必需）
+                const Message& toolMsg = messages_[i + 1];
+                json::Object tObj;
+                tObj["role"] = json::Value(std::string("tool"));
+                tObj["tool_call_id"] = json::Value(callId);
+                tObj["name"] = json::Value(toolMsg.toolName);
+                tObj["content"] = json::Value(toolMsg.content);
+                arr.push_back(json::Value(tObj));
+                
+                i++; // 跳过已消费的 tool 消息
+                continue;
+            }
+            
+            // 无法配对：assistant 按纯文本输出
+            json::Object obj;
+            obj["role"] = json::Value(std::string("assistant"));
+            obj["content"] = json::Value(msg.content);
+            if (includeReasoning && !msg.reasoning.empty()) {
+                obj["reasoning_content"] = json::Value(msg.reasoning);
+            }
+            arr.push_back(json::Value(obj));
+            continue;
+        }
+        
+        // 孤立 tool 消息（前面没有紧邻的可配对 assistant 工具调用）：
+        // 降级为 user 文本，避免 DeepSeek 报 missing field 'tool_call_id'
+        if (msg.role == "tool") {
+            json::Object obj;
+            obj["role"] = json::Value(std::string("user"));
+            std::string text = "[工具结果 " + msg.toolName + "]\n" + msg.content;
+            obj["content"] = json::Value(text);
+            arr.push_back(json::Value(obj));
+            continue;
+        }
+        
+        // 其他消息（system / user）照旧输出
         json::Object obj;
         obj["role"] = json::Value(msg.role);
-        
-        // tool 角色消息附带函数名
-        if (msg.role == "tool" && !msg.toolName.empty()) {
-            obj["name"] = json::Value(msg.toolName);
-        }
         
         if (msg.hasMultiContent()) {
             json::Array contentArr;
             for (const auto& item : msg.contentItems) {
                 json::Object contentObj;
                 if (item.type == ContentType::Text) {
-                    contentObj["type"] = json::Value("text");
+                    contentObj["type"] = json::Value(std::string("text"));
                     contentObj["text"] = json::Value(item.text);
                 } else if (item.type == ContentType::Image) {
-                    contentObj["type"] = json::Value("image_url");
+                    contentObj["type"] = json::Value(std::string("image_url"));
                     json::Object imgUrl;
                     imgUrl["url"] = json::Value(item.imageUrl);
                     contentObj["image_url"] = json::Value(imgUrl);
@@ -309,6 +492,7 @@ json::Value Cache::toJSON() const {
         
         arr.push_back(json::Value(obj));
     }
+    
     return json::Value(arr);
 }
 
@@ -335,6 +519,9 @@ int Cache::estimateMessageTokens(const Message& msg) const {
     int tokens = 0;
     if (!msg.content.empty()) {
         tokens += msg.content.size() / 4;
+    }
+    if (!msg.reasoning.empty()) {
+        tokens += msg.reasoning.size() / 4;
     }
     for (const auto& item : msg.contentItems) {
         if (item.type == ContentType::Text) {
