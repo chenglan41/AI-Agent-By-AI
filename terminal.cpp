@@ -9,6 +9,9 @@
 //   - 写入命令：直接写 UTF-8
 //   - 读取输出：管道内容就是 UTF-8，直接返回；若出现非 UTF-8 字节流（个别 GBK 情况），兜底转 UTF-8。
 
+// 输出缓冲区上限（字节）：Agent 通过 terminal_output 能读到的输出历史，超出后只保留最新部分
+const size_t MAX_OUTPUT_BUFFER = 100000;
+
 static std::string GBKToUTF8(const std::string& gbkStr) {
     if (gbkStr.empty()) return gbkStr;
     
@@ -106,7 +109,9 @@ int TerminalManager::createProcess() {
     }
     
     // Create pseudo console
-    COORD consoleSize = {80, 25};
+    // 调大伪控制台尺寸（200 列 x 100 行），让子进程认为自己有更大的屏幕，
+    // 长输出（如 dir、编译日志）不易被窗口尺寸截断
+    COORD consoleSize = {200, 100};
     void* hConPTY = NULL;
     
     HRESULT hr = pCreatePseudoConsole(consoleSize, hInPipeRead, hOutPipeWrite, 0, &hConPTY);
@@ -244,8 +249,8 @@ std::string TerminalManager::outputProcess(int terminalId) {
     session.buffer += output;
     
     // Keep buffer size reasonable（裁剪时避免劈开 UTF-8 多字节字符）
-    if (session.buffer.size() > 10000) {
-        size_t cut = session.buffer.size() - 10000;
+    if (session.buffer.size() > MAX_OUTPUT_BUFFER) {
+        size_t cut = session.buffer.size() - MAX_OUTPUT_BUFFER;
         std::string tail = session.buffer.substr(cut);
         // 若 tail 以 UTF-8 续字节(0x80-0xBF)开头，说明一个多字节字符被劈开，丢弃残缺字节
         while (!tail.empty() && (((unsigned char)tail[0] & 0xC0) == 0x80)) {
