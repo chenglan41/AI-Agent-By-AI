@@ -287,7 +287,11 @@ inline Value parse(const std::string& input) {
 }
 
 // Escape function - preserves UTF-8 characters (Chinese, etc.)
+// 增强：校验 UTF-8 多字节序列完整性，非法/截断字节替换为 U+FFFD（\xEF\xBF\xBD），
+// 避免坏字节原样进入 JSON，导致服务端报 "invalid unicode code point" 400 错误。
 inline std::string escape(const std::string& s) {
+    static const char REPLACEMENT[] = "\xEF\xBF\xBD"; // U+FFFD 的 UTF-8 编码（合法字符）
+    
     std::string result;
     for (size_t i = 0; i < s.size(); i++) {
         unsigned char c = static_cast<unsigned char>(s[i]);
@@ -300,15 +304,39 @@ inline std::string escape(const std::string& s) {
             case '\r': result += "\\r"; break;
             case '\t': result += "\\t"; break;
             default:
-                // Only escape ASCII control characters (< 0x20)
-                // UTF-8 characters (>= 0x80) are preserved as-is
                 if (c < 0x20) {
+                    // ASCII 控制字符：转义为 \uXXXX
                     char buf[8];
                     std::sprintf(buf, "\\u%04x", c);
                     result += buf;
-                } else {
-                    // Keep UTF-8 bytes as-is (including Chinese characters)
+                } else if (c < 0x80) {
+                    // 普通 ASCII 直接保留
                     result += static_cast<char>(c);
+                } else {
+                    // >= 0x80：校验 UTF-8 多字节序列完整性
+                    int need = 0;
+                    if ((c & 0xE0) == 0xC0) need = 1;
+                    else if ((c & 0xF0) == 0xE0) need = 2;
+                    else if ((c & 0xF8) == 0xF0) need = 3;
+                    
+                    bool valid = (need > 0) && (i + need < s.size());
+                    if (valid) {
+                        for (int k = 1; k <= need; k++) {
+                            if ((static_cast<unsigned char>(s[i + k]) & 0xC0) != 0x80) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    if (valid) {
+                        // 完整的多字节字符，原样保留
+                        for (int k = 0; k <= need; k++) result += s[i + k];
+                        i += need;
+                    } else {
+                        // 非法首字节或截断序列：替换为 U+FFFD，保证 JSON 始终合法
+                        result += REPLACEMENT;
+                    }
                 }
                 break;
         }

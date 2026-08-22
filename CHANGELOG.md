@@ -1,5 +1,17 @@
 # 更新日志
 
+## [1.2.6] - 2026-08-21
+
+### 修复
+
+- 修复文件系统工具中文转码错误：`folder_list` 等工具使用 ANSI(GBK) 版 API（`FindFirstFileA` 等）读取中文文件名，GBK 字节直接混入返回结果，恰好构成非法 UTF-8 序列时导致 API 报 400 `invalid unicode code point`。所有文件系统操作统一改用宽字符(W) API：
+  - 输入路径：UTF-8 → UTF-16（`UTF8ToWide`），解决中文路径找不到的问题
+  - 输出名称：UTF-16 → UTF-8（`WideToUTF8`），中文文件名不再乱码
+  - 涉及 `createFile` / `createFolder` / `deleteFile` / `deleteFolder` / `getFileInfo` / `getFolderInfo` / `listFolder` / `readFile` / `writeFile` 共 9 个工具
+- 顺带修复 `deleteFolder` 双 null 结尾 bug（旧代码 `path + "\0\0"` 实际未追加 null 字符，改为 wstring 显式补两个 `L'\0'`）
+- `json.h` `escape()` 增加 UTF-8 完整性校验兜底：非法/截断的字节序列替换为 U+FFFD，任何来源的坏字节都不会再让 JSON 非法
+- 清空 content.txt 中已混入坏字节的历史消息
+
 ## [1.2.5] - 2026-08-21
 
 ### 变更

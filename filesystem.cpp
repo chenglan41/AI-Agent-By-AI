@@ -1,21 +1,46 @@
 // filesystem.cpp - File system operations implementation
+// 所有路径操作统一使用宽字符(W) API：
+//   输入路径：AI 传入 UTF-8 → 转 UTF-16 后调用 W 版 API，解决中文路径找不到的问题
+//   输出名称：W 版 API 返回 UTF-16（如文件名）→ 转 UTF-8 返回，避免 GBK 字节混入
 #include "filesystem.h"
 #include <windows.h>
-#include <fstream>
+#include <cstdio>
 #include <sstream>
 #include <sys/stat.h>
 
+// ========== 编码转换工具 ==========
+// UTF-8 -> UTF-16
+static std::wstring UTF8ToWide(const std::string& utf8) {
+    if (utf8.empty()) return L"";
+    int len = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, NULL, 0);
+    if (len <= 0) return L"";
+    std::wstring w(len - 1, 0);
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &w[0], len);
+    return w;
+}
+
+// UTF-16 -> UTF-8
+static std::string WideToUTF8(const std::wstring& w) {
+    if (w.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::string s(len - 1, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], len, NULL, NULL);
+    return s;
+}
+// ==================================
+
 std::string FileSystem::createFile(const std::string& path) {
-    std::ofstream file(path.c_str());
-    if (!file.is_open()) {
+    FILE* f = _wfopen(UTF8ToWide(path).c_str(), L"wb");
+    if (!f) {
         return "Failed to create file: " + path;
     }
-    file.close();
+    fclose(f);
     return "ok";
 }
 
 std::string FileSystem::createFolder(const std::string& path) {
-    if (CreateDirectoryA(path.c_str(), NULL)) {
+    if (CreateDirectoryW(UTF8ToWide(path).c_str(), NULL)) {
         return "ok";
     }
     DWORD err = GetLastError();
@@ -26,22 +51,26 @@ std::string FileSystem::createFolder(const std::string& path) {
 }
 
 std::string FileSystem::deleteFile(const std::string& path) {
-    if (DeleteFileA(path.c_str())) {
+    if (DeleteFileW(UTF8ToWide(path).c_str())) {
         return "ok";
     }
     return "Failed to delete file: " + path;
 }
 
 std::string FileSystem::deleteFolder(const std::string& path) {
-    // Use SHFileOperation for recursive delete
-    std::string doubleNullPath = path + "\0\0";
-    SHFILEOPSTRUCTA fileOp;
+    // Use SHFileOperationW for recursive delete
+    // pFrom 需要双 null 结尾；用 wstring 显式补两个 L'\0'（旧代码 path + "\0\0" 实际没追加）
+    std::wstring doubleNullPath = UTF8ToWide(path);
+    doubleNullPath.push_back(L'\0');
+    doubleNullPath.push_back(L'\0');
+    
+    SHFILEOPSTRUCTW fileOp;
     ZeroMemory(&fileOp, sizeof(fileOp));
     fileOp.wFunc = FO_DELETE;
     fileOp.pFrom = doubleNullPath.c_str();
     fileOp.fFlags = FOF_NOCONFIRMATION | FOF_SILENT;
     
-    int result = SHFileOperationA(&fileOp);
+    int result = SHFileOperationW(&fileOp);
     if (result == 0) {
         return "ok";
     }
@@ -49,8 +78,8 @@ std::string FileSystem::deleteFolder(const std::string& path) {
 }
 
 std::string FileSystem::getFileInfo(const std::string& path) {
-    struct stat info;
-    if (stat(path.c_str(), &info) != 0) {
+    struct _stat info;
+    if (_wstat(UTF8ToWide(path).c_str(), &info) != 0) {
         return "File not found: " + path;
     }
     
@@ -64,7 +93,7 @@ std::string FileSystem::getFileInfo(const std::string& path) {
 }
 
 std::string FileSystem::getFolderInfo(const std::string& path) {
-    DWORD attr = GetFileAttributesA(path.c_str());
+    DWORD attr = GetFileAttributesW(UTF8ToWide(path).c_str());
     if (attr == INVALID_FILE_ATTRIBUTES) {
         return "Folder not found: " + path;
     }
@@ -85,10 +114,10 @@ std::string FileSystem::getFolderInfo(const std::string& path) {
 
 std::string FileSystem::listFolder(const std::string& path) {
     std::stringstream ss;
-    std::string searchPath = path + "\\*";
+    std::wstring searchPath = UTF8ToWide(path) + L"\\*";
     
-    WIN32_FIND_DATAA findData;
-    HANDLE hFind = FindFirstFileA(searchPath.c_str(), &findData);
+    WIN32_FIND_DATAW findData;
+    HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
     
     if (hFind == INVALID_HANDLE_VALUE) {
         return "Failed to list folder: " + path;
@@ -98,7 +127,8 @@ std::string FileSystem::listFolder(const std::string& path) {
     int folderCount = 0;
     
     do {
-        std::string name = findData.cFileName;
+        // cFileName 是 UTF-16，转成 UTF-8 返回，中文名不再乱码
+        std::string name = WideToUTF8(findData.cFileName);
         if (name == "." || name == "..") continue;
         
         if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
@@ -108,7 +138,7 @@ std::string FileSystem::listFolder(const std::string& path) {
             ss << "[FILE] " << name << " (" << findData.nFileSizeLow << " bytes)\n";
             fileCount++;
         }
-    } while (FindNextFileA(hFind, &findData));
+    } while (FindNextFileW(hFind, &findData));
     
     FindClose(hFind);
     
@@ -118,26 +148,32 @@ std::string FileSystem::listFolder(const std::string& path) {
 }
 
 std::string FileSystem::readFile(const std::string& path) {
-    std::ifstream file(path.c_str(), std::ios::binary);
-    if (!file.is_open()) {
+    FILE* f = _wfopen(UTF8ToWide(path).c_str(), L"rb");
+    if (!f) {
         return "Failed to open file: " + path;
     }
     
-    std::stringstream ss;
-    ss << file.rdbuf();
-    file.close();
+    std::string content;
+    char buffer[4096];
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), f)) > 0) {
+        content.append(buffer, n);
+    }
+    fclose(f);
     
-    return ss.str();
+    return content;
 }
 
 std::string FileSystem::writeFile(const std::string& path, const std::string& content) {
-    std::ofstream file(path.c_str(), std::ios::binary);
-    if (!file.is_open()) {
+    FILE* f = _wfopen(UTF8ToWide(path).c_str(), L"wb");
+    if (!f) {
         return "Failed to open file for writing: " + path;
     }
     
-    file.write(content.c_str(), content.size());
-    file.close();
+    if (!content.empty()) {
+        fwrite(content.c_str(), 1, content.size(), f);
+    }
+    fclose(f);
     
     return "ok";
 }
