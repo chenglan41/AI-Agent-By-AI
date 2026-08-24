@@ -3,6 +3,8 @@
 #define AGENT_H
 
 #include <string>
+#include <vector>
+#include <future>
 #include <chrono>
 #include "json.h"
 #include "cache.h"
@@ -20,6 +22,8 @@ struct AgentConfig {
     double temperature;
     double topP;
     int maxToolIterations;
+    int toolTimeoutSeconds;     // 单个工具执行超时（秒），超时判定卡死并放弃等待
+    int httpTimeoutSeconds;     // 单次 HTTP 请求超时（秒），超时判定网络卡死
     bool debug;
     bool enableThinking;        // 是否开启思考模式（true 时发送 reasoning_effort）
     std::string thinkingEffort; // 思考强度：low / medium / high（OpenAI 兼容格式）
@@ -27,6 +31,7 @@ struct AgentConfig {
     
     AgentConfig() : screenshotInterval(5), maxTokens(8000), 
                     temperature(0.7), topP(0.9), maxToolIterations(10),
+                    toolTimeoutSeconds(30), httpTimeoutSeconds(120),
                     debug(false), enableThinking(true), thinkingEffort("medium"),
                     outputThinking(true) {}
 };
@@ -74,6 +79,10 @@ private:
     
     // Last reasoning/thinking chain extracted from raw API response
     std::string lastThinking_;
+    
+    // 超时放弃等待的工具执行结果（保留 future，避免析构时阻塞主线程）
+    // 后台线程可能仍在运行，其副作用不确定；promise/future 手动创建的共享状态析构不会 join
+    std::vector<std::future<std::string>> orphanedFutures_;
     
     // Send messages to AI and get response
     std::string sendToAI();

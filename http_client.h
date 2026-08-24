@@ -16,6 +16,10 @@ public:
     // Enable/disable debug output
     void setDebug(bool enabled);
     
+    // Set request timeout in seconds (applied to both POST and GET)
+    // 非法值（<=0）回退为默认 120 秒
+    void setTimeout(long seconds);
+    
     // POST request with JSON body
     std::string post(const std::string& url, const std::string& jsonBody);
     
@@ -36,6 +40,7 @@ private:
     std::string lastError_;
     std::string lastResponse_;
     long lastStatusCode_;
+    long timeout_;   // 请求超时（秒），默认 120
     bool debug_;
     void* curl_; // CURL handle
 };

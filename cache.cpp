@@ -384,16 +384,33 @@ json::Value Cache::toJSON(bool includeReasoning) const {
     json::Array arr;
     int callSeq = 0;
     
+    // 兼容写法：判断服务端是否处于思考模式。
+    // ① 本地配置开启思考（includeReasoning）；
+    // ② 缓存里出现过思考链（anyReasoning，说明服务端实际在返回 reasoning_content，
+    //    即使本地关了思考也可能仍处于 thinking mode）。
+    // 两种情况任一成立都按思考模式处理：缺思考链的旧 assistant 消息必须跳过，
+    // 否则下一轮请求缺 reasoning_content 会被 API 以 400 拒绝。
+    bool anyReasoning = false;
+    if (!includeReasoning) {
+        for (const auto& m : messages_) {
+            if (m.role == "assistant" && !m.reasoning.empty()) {
+                anyReasoning = true;
+                break;
+            }
+        }
+    }
+    bool thinkingMode = includeReasoning || anyReasoning;
+    
     for (size_t i = 0; i < messages_.size(); i++) {
         const Message& msg = messages_[i];
         
         // assistant 消息：如果后面紧邻 tool 消息且文本中能提取出工具调用，
         // 输出 OpenAI tool_calls 格式，并给紧邻的 tool 消息生成配对的 tool_call_id
         if (msg.role == "assistant") {
-            // 思考模式下 DeepSeek 要求每条 assistant 消息都回传 reasoning_content，
+            // 思考模式下每条 assistant 消息都必须回传 reasoning_content，
             // 缺思考链的旧消息（如关闭思考模式时期产生的）直接跳过，避免 400。
-            // 其后紧跟的 tool 消息会作为孤立 tool 降级为 user 文本，上下文不丢。
-            if (includeReasoning && msg.reasoning.empty()) {
+            // 其后紧跟的 tool 消息会作为孤立 tool 降级为 user 文本。
+            if (thinkingMode && msg.reasoning.empty()) {
                 continue;
             }
             
@@ -412,8 +429,9 @@ json::Value Cache::toJSON(bool includeReasoning) const {
                 } else {
                     aObj["content"] = json::Value(restText);
                 }
-                // 思考模式：必须回传 reasoning_content，否则 DeepSeek 400
-                if (includeReasoning && !msg.reasoning.empty()) {
+                // 兼容写法：只要有思考链就回传，不再看本地配置。
+                // 本地关闭思考时服务端可能仍处于 thinking mode，不回传会 400。
+                if (!msg.reasoning.empty()) {
                     aObj["reasoning_content"] = json::Value(msg.reasoning);
                 }
                 
@@ -448,7 +466,8 @@ json::Value Cache::toJSON(bool includeReasoning) const {
             json::Object obj;
             obj["role"] = json::Value(std::string("assistant"));
             obj["content"] = json::Value(msg.content);
-            if (includeReasoning && !msg.reasoning.empty()) {
+            // 兼容写法：只要有思考链就回传，不再看本地配置。
+            if (!msg.reasoning.empty()) {
                 obj["reasoning_content"] = json::Value(msg.reasoning);
             }
             arr.push_back(json::Value(obj));

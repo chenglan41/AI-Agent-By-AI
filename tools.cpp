@@ -117,6 +117,14 @@ std::string ToolDispatcher::execute(const std::string& toolName, const json::Val
                                      params["content"].asString());
     }
     
+    // Agent exit request (防卡死退出请求)
+    // 注意：agent.cpp 的 processInput 会在执行前拦截 agent_exit，
+    // 这里保留分支作为兜底（如未来绕过拦截直接调用的情况）
+    if (toolName == "agent_exit") {
+        std::string reason = params.has("reason") ? params["reason"].asString() : "(no reason)";
+        return "Exit request received: " + reason;
+    }
+    
     return "Unknown tool: " + toolName;
 }
 
@@ -140,5 +148,6 @@ std::string ToolDispatcher::getToolList() {
     ss << "- folder_list: List folder (path)\n";
     ss << "- file_read: Read file (path)\n";
     ss << "- file_write: Write file (path, content)\n";
+    ss << "- agent_exit: Request exit when stuck (reason)\n";
     return ss.str();
 }

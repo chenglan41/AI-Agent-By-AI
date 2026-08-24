@@ -51,7 +51,7 @@ g++ -O2 -std=c++11 -DCURL_STATICLIB -c -I"%CURL_DIR%\include" -o http_client.o h
 if errorlevel 1 goto error
 
 echo [11/11] Linking...
-g++ -O2 -o %OUTPUT% main.o agent.o cache.o tools.o terminal.o mouse.o keyboard.o filesystem.o screenshot.o jpg.o http_client.o -L"%CURL_DIR%\lib" -lcurl -lgdiplus -lole32 -luuid -lwinmm -lgdi32 -loleaut32 -lws2_32 -lssl -lcrypto -lssh2 -lz -lzstd -lbrotlidec -lbrotlicommon -lnghttp2 -lnghttp3 -lngtcp2 -lngtcp2_crypto_libressl -lpsl -static-libgcc -static-libstdc++
+g++ -O2 -o %OUTPUT% main.o agent.o cache.o tools.o terminal.o mouse.o keyboard.o filesystem.o screenshot.o jpg.o http_client.o -L"%CURL_DIR%\lib" -lcurl -lgdiplus -lole32 -luuid -lwinmm -lgdi32 -loleaut32 -lws2_32 -lssl -lcrypto -lssh2 -lz -lzstd -lbrotlidec -lbrotlicommon -lnghttp2 -lnghttp3 -lngtcp2 -lngtcp2_crypto_libressl -lpsl -static-libgcc -static-libstdc++ -static -lcrypt32 -lwldap32 -lbcrypt -lws2_32 -lsecur32 -liphlpapi
 if errorlevel 1 goto error
 
 echo.

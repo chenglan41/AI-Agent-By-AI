@@ -4,9 +4,11 @@
 //   输出名称：W 版 API 返回 UTF-16（如文件名）→ 转 UTF-8 返回，避免 GBK 字节混入
 #include "filesystem.h"
 #include <windows.h>
+#include <shellapi.h>   // SHFileOperationW / SHFILEOPSTRUCTW
 #include <cstdio>
 #include <sstream>
 #include <sys/stat.h>
+#include <cwctype>
 
 // ========== 编码转换工具 ==========
 // UTF-8 -> UTF-16
@@ -30,7 +32,43 @@ static std::string WideToUTF8(const std::wstring& w) {
 }
 // ==================================
 
+// ========== 慢路径预检查 ==========
+// 网络盘/UNC 路径的文件操作（fopen 等）可能长时间阻塞（SMB 超时），
+// 主循环要等满 toolTimeoutSeconds 才能靠执行超时救场。这里在工具执行前秒拒慢路径，
+// 让模型立刻换本地路径，避免每次白卡 30 秒。
+static bool isSlowPath(const std::string& utf8Path) {
+    if (utf8Path.empty()) return false;  // 空路径 fopen 会立刻失败，无需预检查
+
+    std::wstring wpath = UTF8ToWide(utf8Path);
+    if (wpath.empty()) return false;
+
+    // UNC 路径：\\server\share\...（\\?\ 设备前缀同样秒拒）
+    if (wpath.size() >= 2 && wpath[0] == L'\\' && wpath[1] == L'\\') {
+        return true;
+    }
+
+    // 取所在盘根路径：绝对路径取盘符，相对路径取当前工作目录所在盘
+    std::wstring root;
+    if (wpath.size() >= 2 && iswalpha(wpath[0]) && wpath[1] == L':') {
+        root = wpath.substr(0, 2) + L"\\";  // 形如 "X:\"
+    } else {
+        wchar_t cwd[MAX_PATH] = {0};
+        DWORD len = GetCurrentDirectoryW(MAX_PATH, cwd);
+        if (len == 0 || len >= MAX_PATH) return false;
+        if (len < 2 || !iswalpha(cwd[0]) || cwd[1] != L':') return false;
+        root = std::wstring(cwd, 2) + L"\\";
+    }
+
+    // 仅拒绝网络映射盘（DRIVE_REMOTE），本地盘（DRIVE_FIXED / REMOVABLE / RAMDISK）放行
+    return GetDriveTypeW(root.c_str()) == DRIVE_REMOTE;
+}
+// ==================================
+
 std::string FileSystem::createFile(const std::string& path) {
+    // 慢路径预检查：网络盘/UNC 秒拒，避免 fopen 长时间阻塞
+    if (isSlowPath(path)) {
+        return "Path check failed: network drive or UNC path may block for a long time. Use a local path (e.g. C:\\...)";
+    }
     FILE* f = _wfopen(UTF8ToWide(path).c_str(), L"wb");
     if (!f) {
         return "Failed to create file: " + path;
@@ -148,6 +186,10 @@ std::string FileSystem::listFolder(const std::string& path) {
 }
 
 std::string FileSystem::readFile(const std::string& path) {
+    // 慢路径预检查：网络盘/UNC 秒拒，避免 fopen 长时间阻塞
+    if (isSlowPath(path)) {
+        return "Path check failed: network drive or UNC path may block for a long time. Use a local path (e.g. C:\\...)";
+    }
     FILE* f = _wfopen(UTF8ToWide(path).c_str(), L"rb");
     if (!f) {
         return "Failed to open file: " + path;
@@ -165,6 +207,10 @@ std::string FileSystem::readFile(const std::string& path) {
 }
 
 std::string FileSystem::writeFile(const std::string& path, const std::string& content) {
+    // 慢路径预检查：网络盘/UNC 秒拒，避免 fopen 长时间阻塞
+    if (isSlowPath(path)) {
+        return "Path check failed: network drive or UNC path may block for a long time. Use a local path (e.g. C:\\...)";
+    }
     FILE* f = _wfopen(UTF8ToWide(path).c_str(), L"wb");
     if (!f) {
         return "Failed to open file for writing: " + path;

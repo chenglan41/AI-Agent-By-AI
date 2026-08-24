@@ -68,6 +68,8 @@ bool loadConfig(const std::string& filename, AgentConfig& config) {
         if (root.has("temperature")) config.temperature = root["temperature"].asNumber();
         if (root.has("topP")) config.topP = root["topP"].asNumber();
         if (root.has("maxToolIterations")) config.maxToolIterations = (int)root["maxToolIterations"].asNumber();
+        if (root.has("toolTimeoutSeconds")) config.toolTimeoutSeconds = (int)root["toolTimeoutSeconds"].asNumber();
+        if (root.has("httpTimeoutSeconds")) config.httpTimeoutSeconds = (int)root["httpTimeoutSeconds"].asNumber();
         if (root.has("debug")) config.debug = root["debug"].asBool();
         
         // 思考模式配置（OpenAI 兼容格式）
@@ -125,6 +127,8 @@ int main(int argc, char* argv[]) {
         std::cout << "Thinking effort: " << config.thinkingEffort << std::endl;
     }
     std::cout << "Thinking output: " << (config.outputThinking ? "ON" : "OFF") << std::endl;
+    std::cout << "Tool timeout: " << config.toolTimeoutSeconds << "s" << std::endl;
+    std::cout << "HTTP timeout: " << config.httpTimeoutSeconds << "s" << std::endl;
     
     // Create and run agent
     Agent agent;

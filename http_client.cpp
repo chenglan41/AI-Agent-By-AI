@@ -11,7 +11,7 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* use
     return totalSize;
 }
 
-HttpClient::HttpClient() : curl_(NULL), lastStatusCode_(0), debug_(false) {
+HttpClient::HttpClient() : curl_(NULL), lastStatusCode_(0), timeout_(120), debug_(false) {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     curl_ = curl_easy_init();
 }
@@ -29,6 +29,14 @@ void HttpClient::setHeader(const std::string& key, const std::string& value) {
 
 void HttpClient::setDebug(bool enabled) {
     debug_ = enabled;
+}
+
+void HttpClient::setTimeout(long seconds) {
+    if (seconds > 0) {
+        timeout_ = seconds;
+    } else {
+        timeout_ = 120;  // 非法值回退默认 120 秒
+    }
 }
 
 std::string HttpClient::post(const std::string& url, const std::string& jsonBody) {
@@ -73,8 +81,8 @@ std::string HttpClient::post(const std::string& url, const std::string& jsonBody
     curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 0L);
     
-    // Timeout
-    curl_easy_setopt(curl_, CURLOPT_TIMEOUT, 120L);
+    // Timeout（可配置，默认 120 秒）
+    curl_easy_setopt(curl_, CURLOPT_TIMEOUT, timeout_);
     
     // Perform request
     CURLcode res = curl_easy_perform(curl_);
@@ -149,8 +157,8 @@ std::string HttpClient::get(const std::string& url) {
     curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 0L);
     
-    // Timeout
-    curl_easy_setopt(curl_, CURLOPT_TIMEOUT, 60L);
+    // Timeout（可配置，默认 120 秒）
+    curl_easy_setopt(curl_, CURLOPT_TIMEOUT, timeout_);
     
     // Perform request
     CURLcode res = curl_easy_perform(curl_);

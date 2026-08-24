@@ -7,6 +7,7 @@
 #include <chrono>
 #include <regex>
 #include <string>
+#include <future>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -83,6 +84,17 @@ bool isUTF8(const std::string& str) {
 }
 #endif
 
+// 按字节截断字符串，并回退被切断的多字节 UTF-8 字符的连续字节，
+// 避免截断点落在中文等多字节字符中间产生乱码
+static std::string truncateUTF8(const std::string& str, size_t maxLen) {
+    if (str.size() <= maxLen) return str;
+    std::string cut = str.substr(0, maxLen);
+    while (!cut.empty() && ((unsigned char)cut.back() & 0xC0) == 0x80) {
+        cut.pop_back();
+    }
+    return cut;
+}
+
 Agent::Agent() : lastScreenshotTime_(std::chrono::steady_clock::now()) {
 }
 
@@ -94,6 +106,8 @@ bool Agent::init(const AgentConfig& config) {
     http_.setHeader("Authorization", "Bearer " + config_.apiKey);
     http_.setHeader("Content-Type", "application/json");
     http_.setDebug(config_.debug);
+    // 可配置 HTTP 超时（秒），超时判定网络卡死；非法值在 HttpClient 内部回退 120 秒
+    http_.setTimeout(config_.httpTimeoutSeconds);
     return true;
 }
 
@@ -171,7 +185,14 @@ void Agent::processInput(const std::string& userInput) {
     
     // Send to AI and handle tool calls
     int iterations = 0;
+    // 防卡死：记录上一次工具调用的签名，用于检测连续重复调用
+    std::string lastToolSignature;
+    int lastToolRepeatCount = 0;
     while (iterations < config_.maxToolIterations) {
+        // 防卡死：每轮循环先检查缓存，超限及时压缩，
+        // 避免长工具循环中请求体持续膨胀拖慢/卡死请求
+        compressToMemory();
+        
         if (config_.debug) {
             std::cout << "[Thinking...]" << std::endl;
         }
@@ -212,20 +233,131 @@ void Agent::processInput(const std::string& userInput) {
         if (parseToolCall(response, toolName, params)) {
             if (config_.debug) {
                 std::cout << "[Tool Call]: " << toolName << std::endl;
-                std::cout << "[Tool Params]: " << json::serialize(params) << std::endl;
+                // 防刷屏：参数超 500 字符截断打印（UTF-8 安全截断，避免中文被切断乱码）
+                std::string paramsStr = json::serialize(params);
+                size_t paramsTotal = paramsStr.size();
+                if (paramsTotal > 500) {
+                    paramsStr = truncateUTF8(paramsStr, 500) + "... (truncated, total " + std::to_string(paramsTotal) + " chars)";
+                }
+#ifdef _WIN32
+                if (isUTF8(paramsStr)) {
+                    paramsStr = UTF8ToGBK(paramsStr);
+                }
+                std::cout << "[Tool Params]: " << paramsStr << std::endl;
+#else
+                std::cout << "[Tool Params]: " << paramsStr << std::endl;
+#endif
             }
             
-            // Execute tool
-            std::string result = tools_.execute(toolName, params);
-            if (config_.debug) {
+            // 防卡死拦截 1：模型主动请求退出本轮任务，记录并立即结束循环
+            if (toolName == "agent_exit") {
+                std::string exitReason = params.has("reason") ? params["reason"].asString() : "(未说明原因)";
+                
+                json::Value storeObj;
+                storeObj["tool"] = json::Value(toolName);
+                storeObj["params"] = params;
+                cache_.addMessage("assistant", "```json\n" + json::serialize(storeObj) + "\n```", lastThinking_);
+                cache_.addToolResult(toolName, "Exit request accepted");
+                
+                if (config_.debug) {
+                    std::cout << "[Agent Exit Request]: " << exitReason << std::endl;
+                }
 #ifdef _WIN32
+                std::string displayReason = exitReason;
+                if (isUTF8(displayReason)) {
+                    displayReason = UTF8ToGBK(displayReason);
+                }
+                std::cout << "\n[Agent]: " << displayReason << std::endl;
+#else
+                std::cout << "\n[Agent]: " << exitReason << std::endl;
+#endif
+                break;
+            }
+            
+            // 防卡死拦截 2：同一工具+参数连续重复 3 次判定为卡死，强制结束本轮
+            std::string toolSignature = toolName + ":" + json::serialize(params);
+            if (toolSignature == lastToolSignature) {
+                lastToolRepeatCount++;
+            } else {
+                lastToolSignature = toolSignature;
+                lastToolRepeatCount = 1;
+            }
+            if (lastToolRepeatCount >= 3) {
+                json::Value storeObj;
+                storeObj["tool"] = json::Value(toolName);
+                storeObj["params"] = params;
+                cache_.addMessage("assistant", "```json\n" + json::serialize(storeObj) + "\n```", lastThinking_);
+                cache_.addToolResult(toolName, "Blocked: identical tool call repeated 3 times, judged as stuck, loop terminated");
+                
+#ifdef _WIN32
+                std::string stuckMsg = UTF8ToGBK("检测到同一工具调用连续重复 3 次，判定为卡死，本轮任务已结束");
+                std::cout << "\n[Agent]: " << stuckMsg << std::endl;
+#else
+                std::cout << "\n[Agent]: 检测到同一工具调用连续重复 3 次，判定为卡死，本轮任务已结束" << std::endl;
+#endif
+                break;
+            }
+            
+            // Execute tool with timeout protection（工具执行超时保护）
+            // 工具内部可能阻塞（写大文件、网络盘、管道写满等），同步调用会卡死整轮，
+            // 之前的防卡死拦截都来不及生效。超过 toolTimeoutSeconds 未返回则放弃等待，
+            // 把超时结果作为 tool result 回传，让模型换方式或调用 agent_exit。
+            std::string result;
+            {
+                std::shared_ptr<std::promise<std::string>> execPromise =
+                    std::make_shared<std::promise<std::string>>();
+                std::future<std::string> execFuture = execPromise->get_future();
+                std::string execToolName = toolName;
+                json::Value execParams = params;
+                std::thread worker([this, execToolName, execParams, execPromise]() {
+                    try {
+                        execPromise->set_value(tools_.execute(execToolName, execParams));
+                    } catch (...) {
+                        try { execPromise->set_value(std::string("Tool execution threw an exception")); }
+                        catch (...) {}
+                    }
+                });
+                worker.detach();
+
+                std::future_status status = execFuture.wait_for(
+                    std::chrono::seconds(config_.toolTimeoutSeconds));
+
+                if (status == std::future_status::timeout) {
+                    result = "Tool execution timeout after " + std::to_string(config_.toolTimeoutSeconds)
+                           + "s, judged as stuck. The tool may still be running in background with uncertain side effects. "
+                           + "Do NOT retry the same tool with identical params. Use a different approach, "
+                           + "or call agent_exit if the task cannot proceed.";
+                    // 保留 future：后台线程可能仍阻塞，future 留存避免被提前析构；
+                    // 共享状态随 Agent 销毁释放，detach 线程自行结束
+                    orphanedFutures_.push_back(std::move(execFuture));
+
+#ifdef _WIN32
+                    std::string timeoutMsg = UTF8ToGBK("工具执行超时（" + std::to_string(config_.toolTimeoutSeconds) + "秒），判定为卡死，已放弃等待该工具结果");
+                    std::cout << "\n[Agent]: " << timeoutMsg << std::endl;
+#else
+                    std::cout << "\n[Agent]: 工具执行超时（" << config_.toolTimeoutSeconds << "秒），判定为卡死，已放弃等待该工具结果" << std::endl;
+#endif
+                } else {
+                    try {
+                        result = execFuture.get();
+                    } catch (...) {
+                        result = "Tool execution threw an exception";
+                    }
+                }
+            }
+            if (config_.debug) {
+                // 防刷屏：结果超 1000 字符截断打印（UTF-8 安全截断，避免中文被切断乱码）
                 std::string displayResult = result;
+                if (displayResult.size() > 1000) {
+                    displayResult = truncateUTF8(displayResult, 1000) + "... (truncated, total " + std::to_string(result.size()) + " chars)";
+                }
+#ifdef _WIN32
                 if (isUTF8(displayResult)) {
                     displayResult = UTF8ToGBK(displayResult);
                 }
                 std::cout << "[Tool Result]: " << displayResult << std::endl;
 #else
-                std::cout << "[Tool Result]: " << result << std::endl;
+                std::cout << "[Tool Result]: " << displayResult << std::endl;
 #endif
             }
             
@@ -688,12 +820,23 @@ static json::Value makeTool(const std::string& name,
     return tool;
 }
 
+// ========== 工具调用格式强制规定（每次请求都以 system 消息发送，见 buildRequestJSON） ==========
+// 之前的规范只写在 C++ 注释里，注释不会发送给模型，实际未生效；现改为随请求发送。
+static const std::string kToolCallFormatRules = std::string(
+    "【工具调用格式强制规定】（必须严格遵守，违反会导致工具调用失败）\n"
+    "1. 需要调用工具时，必须且只能输出一个 JSON 代码块，格式如下，前后不要附加任何其他文字：\n"
+    "```json\n"
+    "{\"tool\":\"工具名\",\"params\":{参数对象}}\n"
+    "```\n"
+    "2. params 必须是纯参数对象本身（如 {\"terminal_id\":1}），禁止套 {\"tool\":...} 外层包装，禁止把 {\"tool\":...,\"params\":...} 包装格式嵌套进 params。\n"
+    "3. params 必须包含工具定义中要求的全部必需参数，参数名必须与工具定义完全一致，禁止编造参数名或省略参数。\n"
+    "4. terminal_id 必须使用 terminal_create 返回的真实 ID，禁止编造 ID。\n"
+    "5. 终端工具必须先创建再使用：先调用 terminal_create 创建终端并记住返回 ID，再用 terminal_input 输入命令、terminal_output 读取输出。\n"
+    "6. 【安全红线】禁止 key_combo 组合 ctrl+c、ctrl+break、ctrl+pause（会杀死 Agent 自身）；中断终端程序用 terminal_remove 或向终端发送 exit。\n"
+    "7. 一次只调用一个工具，等工具结果返回后再决定下一步。\n"
+    "8. 【防卡死】同一操作连续失败 2 次以上、终端长时间无输出、工具返回 timeout（执行超时）或任务无法推进时，必须停止重试，调用 agent_exit 工具（params 示例：{\"reason\":\"卡死原因说明\"}）请求退出本轮任务，禁止无限重复调用同一工具。");
+
 // Build the full tool list for the AI
-// ========== 工具使用规范（随 tools 一起发给模型，每次请求都可见） ==========
-// 1. arguments 只填参数对象本身（如 {"terminal_id":1}），严禁套 {"tool":...} 外层包装；
-// 2. 【安全红线】禁止 key_combo 发出 ctrl+c / ctrl+break / ctrl+pause 自杀组合键，
-//    中断终端程序一律用 terminal_remove 或向终端发送 exit；
-// 3. terminal_id 必须使用 terminal_create 返回的 ID，禁止编造。
 static json::Array buildToolList() {
     json::Array tools;
 
@@ -701,7 +844,7 @@ static json::Array buildToolList() {
     {
         json::Object p;
         json::Array r;
-        tools.push_back(makeTool("terminal_create", "创建一个新的终端会话并返回终端ID。请务必记住返回的ID，后续 terminal_input、terminal_output、terminal_remove 都需要传入该ID。注意：arguments 里直接填参数本身（如 {}），不要套 {\"tool\":...} 外层包装", p, r));
+        tools.push_back(makeTool("terminal_create", "创建一个新的终端会话并返回终端ID。任何终端操作前都要先创建终端：必须先调用本工具创建终端，并务必记住返回的ID，后续 terminal_input、terminal_output、terminal_remove 都需要传入该ID。注意：arguments 里直接填参数本身（如 {}），不要套 {\"tool\":...} 外层包装", p, r));
     }
     {
         json::Object p;
@@ -717,14 +860,14 @@ static json::Array buildToolList() {
         json::Array r;
         r.push_back(json::Value(std::string("terminal_id")));
         r.push_back(json::Value(std::string("command")));
-        tools.push_back(makeTool("terminal_input", "向指定终端发送一条命令并执行。terminal_id 是 terminal_create 返回的ID。arguments 只填参数本身，如 {\"terminal_id\":1,\"command\":\"dir\"}。需要中断终端中正在运行的程序时，请发送 exit 或用 terminal_remove，禁止发送 ctrl+c", p, r));
+        tools.push_back(makeTool("terminal_input", "向指定终端发送一条命令并执行。终端要先创建再输入：必须先调用 terminal_create 创建终端并获取 terminal_id，然后才能发送命令，禁止未创建终端就输入。arguments 只填参数本身，如 {\"terminal_id\":1,\"command\":\"dir\"}。需要中断终端中正在运行的程序时，请发送 exit 或用 terminal_remove，禁止发送 ctrl+c", p, r));
     }
     {
         json::Object p;
         p["terminal_id"] = makeProperty("integer", "终端会话ID");
         json::Array r;
         r.push_back(json::Value(std::string("terminal_id")));
-        tools.push_back(makeTool("terminal_output", "读取指定终端的输出缓冲区。若还没有终端，必须先调用 terminal_create 创建并获取终端ID。arguments 只填参数本身，如 {\"terminal_id\":1}", p, r));
+        tools.push_back(makeTool("terminal_output", "读取指定终端的输出缓冲区。终端要先创建再读取：若还没有终端，必须先调用 terminal_create 创建并获取终端ID。arguments 只填参数本身，如 {\"terminal_id\":1}", p, r));
     }
 
     // --- Mouse tools ---
@@ -839,13 +982,36 @@ static json::Array buildToolList() {
         tools.push_back(makeTool("file_write", "写入内容到文件(覆盖)", p, r));
     }
 
+    // --- Agent exit request (防卡死退出请求) ---
+    {
+        json::Object p;
+        p["reason"] = makeProperty("string", "退出原因说明（可省略）");
+        json::Array r;
+        tools.push_back(makeTool("agent_exit", "请求退出本轮任务。当任务已卡死、无法继续推进、终端长时间无输出、工具执行超时（工具结果返回 timeout 信息）、同一操作连续失败 2 次以上时，必须调用本工具请求退出，禁止无限重试。arguments 只填参数本身，如 {\"reason\":\"任务无法完成\"}", p, r));
+    }
+
     return tools;
 }
 
 std::string Agent::buildRequestJSON() {
     json::Value root;
+    
+    // 工具调用格式强制规定：作为 system 消息插到 messages 最前面，每次请求都可见，
+    // 强制模型按规范输出工具调用（避免包装格式/缺参/编造参数导致调用失败）
+    json::Array msgs;
+    json::Object formatObj;
+    formatObj["role"] = json::Value(std::string("system"));
+    formatObj["content"] = json::Value(kToolCallFormatRules);
+    msgs.push_back(json::Value(formatObj));
+    
+    json::Value cached = cache_.toJSON(config_.enableThinking);
+    const json::Array& cachedArr = cached.asArray();
+    for (size_t i = 0; i < cachedArr.size(); i++) {
+        msgs.push_back(cachedArr[i]);
+    }
+    
     // 思考模式开启时回传历史 assistant 消息的 reasoning_content（DeepSeek 必需）
-    root["messages"] = cache_.toJSON(config_.enableThinking);
+    root["messages"] = json::Value(msgs);
     root["model"] = config_.model;
     root["max_tokens"] = config_.maxTokens;
     root["temperature"] = config_.temperature;
